@@ -1,5 +1,6 @@
-import React, { useState, useMemo } from "react";
-import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive } from "lucide-react";
+import React, { useState, useMemo, useEffect, useRef } from "react";
+import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw } from "lucide-react";
+import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes } from "./finnhubClient.js";
 
 // ============================================
 // STOCK DATABASE mit erweitertem Kontext fuer LLM
@@ -193,43 +194,179 @@ export default function TradingApp() {
   const [tab, setTab] = useState("daily");
   const [selectedStock, setSelectedStock] = useState(null);
   const [query, setQuery] = useState("");
+  
+  // Live-Daten-State
+  const [liveQuotes, setLiveQuotes] = useState({}); // { TICKER: { price, change, ... } }
+  const [liveStocks, setLiveStocks] = useState({}); // Aktien NICHT in STOCK_DB (Live-only)
+  const [liveSearchResults, setLiveSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [apiStatus, setApiStatus] = useState("unknown"); // "ok" | "error" | "unknown"
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const searchDebounceRef = useRef(null);
 
-  const allStocks = Object.values(STOCK_DB);
-  const dailyRanked = useMemo(() => allStocks.map(s => ({ ...s, score: calcDailyScore(s) })).sort((a,b) => b.score - a.score), []);
-  const longTermRanked = useMemo(() => allStocks.map(s => ({ ...s, score: calcLongTermScore(s) })).sort((a,b) => b.score - a.score), []);
-  const searchResults = useMemo(() => {
-    if (!query) return [];
-    const q = query.toUpperCase();
-    return allStocks.filter(s => s.ticker.includes(q) || s.name.toUpperCase().includes(q));
+  // Hilfsfunktion: Stock aus DB oder Live holen, mit Live-Quote merge
+  const getEnrichedStock = (ticker) => {
+    const base = STOCK_DB[ticker] || liveStocks[ticker];
+    if (!base) return null;
+    const liveQuote = liveQuotes[ticker];
+    if (liveQuote) {
+      return { ...base, price: liveQuote.price, change: liveQuote.change, _live: true };
+    }
+    return base;
+  };
+
+  const allStocks = Object.values(STOCK_DB).map(s => getEnrichedStock(s.ticker)).filter(Boolean);
+
+  // Live-Quotes fuer alle Demo-Stocks holen
+  const refreshQuotes = async () => {
+    setRefreshing(true);
+    try {
+      const symbols = Object.keys(STOCK_DB).filter(t => t !== "BTC"); // BTC nicht via Finnhub stock-quote
+      const quotes = await getMultipleQuotes(symbols);
+      const quoteMap = {};
+      quotes.forEach(q => {
+        if (q.price && q.price > 0) {
+          quoteMap[q.symbol] = { price: q.price, change: q.change || 0 };
+        }
+      });
+      setLiveQuotes(prev => ({ ...prev, ...quoteMap }));
+      setApiStatus(Object.keys(quoteMap).length > 0 ? "ok" : "error");
+      setLastRefresh(new Date());
+    } catch (err) {
+      console.error("Refresh fehlgeschlagen:", err);
+      setApiStatus("error");
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // Beim ersten Laden: Quotes refreshen
+  useEffect(() => {
+    refreshQuotes();
+  }, []);
+
+  // Live-Suche mit Debounce
+  useEffect(() => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    if (!query || query.length < 1) {
+      setLiveSearchResults([]);
+      return;
+    }
+    searchDebounceRef.current = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const results = await searchSymbols(query);
+        setLiveSearchResults(results);
+      } catch (err) {
+        console.error("Search failed:", err);
+        setLiveSearchResults([]);
+      } finally {
+        setSearching(false);
+      }
+    }, 300);
+    return () => { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
   }, [query]);
+
+  // Wenn neue Aktie ausgewaehlt die NICHT in STOCK_DB ist -> Live-Profil holen
+  const selectStock = async (ticker) => {
+    setSelectedStock(ticker);
+    setQuery("");
+    setLiveSearchResults([]);
+    setTab("detail");
+    
+    if (!STOCK_DB[ticker] && !liveStocks[ticker]) {
+      // Hole Live Quote + Profile
+      try {
+        const [quote, profile] = await Promise.all([
+          getQuote(ticker).catch(() => null),
+          getProfile(ticker).catch(() => null)
+        ]);
+        if (quote && profile && profile.name) {
+          // Erstelle minimales Stock-Objekt mit Live-Daten + neutralen Defaults
+          const newStock = {
+            ticker,
+            name: profile.name,
+            price: quote.price,
+            change: quote.change || 0,
+            sector: profile.sector || "Unknown",
+            marketCap: formatMarketCap(profile.marketCap),
+            // Neutrale Defaults fuer Scores (Demo-Felder bei unbekannten Aktien)
+            daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 50 },
+            longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0.5, roe: 10, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 50 },
+            whales: [],
+            context: `${profile.name} ist ein ${profile.sector || "Unbekannt"}-Unternehmen mit Sitz in ${profile.country || "USA"}. Live-Daten von Finnhub. Whale-Tracking und Fundamentals werden in Phase 2B angebunden.`,
+            _liveOnly: true
+          };
+          setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
+          setLiveQuotes(prev => ({ ...prev, [ticker]: { price: quote.price, change: quote.change || 0 } }));
+        }
+      } catch (err) {
+        console.error("Stock laden fehlgeschlagen:", err);
+      }
+    }
+  };
+
+  const dailyRanked = useMemo(() => allStocks.map(s => ({ ...s, score: calcDailyScore(s) })).sort((a,b) => b.score - a.score), [liveQuotes]);
+  const longTermRanked = useMemo(() => allStocks.map(s => ({ ...s, score: calcLongTermScore(s) })).sort((a,b) => b.score - a.score), [liveQuotes]);
 
   return (
     <div style={{ minHeight: "100vh", background: "#0a0e1a", color: "#e4e7ee", fontFamily: "'JetBrains Mono', 'SF Mono', monospace" }}>
       <div style={{ borderBottom: "1px solid #1f2937", padding: "20px 32px", position: "sticky", top: 0, zIndex: 50, background: "#0a0e1a" }}>
         <div style={{ maxWidth: 1400, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16 }}>
           <div>
-            <div style={{ fontSize: 10, letterSpacing: 3, color: "#10b981", marginBottom: 4 }}>▲ TRADING INTELLIGENCE / PHASE 01.3</div>
+            <div style={{ fontSize: 10, letterSpacing: 3, color: "#10b981", marginBottom: 4, display: "flex", alignItems: "center", gap: 8 }}>
+              <span>▲ TRADING INTELLIGENCE / PHASE 02.A</span>
+              {apiStatus === "ok" && <span style={{ color: "#10b981", display: "flex", alignItems: "center", gap: 4 }}><Wifi size={10} />LIVE</span>}
+              {apiStatus === "error" && <span style={{ color: "#ef4444", display: "flex", alignItems: "center", gap: 4 }}><WifiOff size={10} />OFFLINE</span>}
+            </div>
             <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0, letterSpacing: -0.5 }}>Market Command<span style={{ color: "#10b981" }}>.</span></h1>
-          </div>
-          <div style={{ position: "relative", minWidth: 300 }}>
-            <Search size={14} style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", color: "#6b7280" }} />
-            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Ticker suchen..."
-              style={{ width: "100%", background: "#111827", border: "1px solid #1f2937", padding: "10px 14px 10px 40px", color: "#e4e7ee", fontFamily: "inherit", fontSize: 12, borderRadius: 4, outline: "none", boxSizing: "border-box" }} />
-            {searchResults.length > 0 && (
-              <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, background: "#111827", border: "1px solid #1f2937", borderRadius: 4, zIndex: 10, maxHeight: 240, overflowY: "auto" }}>
-                {searchResults.map(s => (
-                  <div key={s.ticker} onClick={() => { setSelectedStock(s.ticker); setQuery(""); setTab("detail"); }}
-                    style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #1f2937", display: "flex", justifyContent: "space-between", fontSize: 12 }}
-                    onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
-                    onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-                    <div><span style={{ fontWeight: 700, color: "#10b981" }}>{s.ticker}</span><span style={{ color: "#6b7280", marginLeft: 10 }}>{s.name}</span></div>
-                    <div>${s.price.toLocaleString()}</div>
-                  </div>
-                ))}
+            {lastRefresh && (
+              <div style={{ fontSize: 9, color: "#6b7280", marginTop: 4, letterSpacing: 1 }}>
+                Letzte Aktualisierung: {lastRefresh.toLocaleTimeString()}
               </div>
             )}
           </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <button onClick={refreshQuotes} disabled={refreshing}
+              style={{ background: "#111827", border: "1px solid #1f2937", color: "#e4e7ee", padding: "10px 14px", fontFamily: "inherit", fontSize: 11, letterSpacing: 1.5, fontWeight: 600, borderRadius: 4, cursor: refreshing ? "wait" : "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+              <RefreshCw size={12} style={{ animation: refreshing ? "spin 1s linear infinite" : "none" }} />
+              {refreshing ? "LADEN..." : "REFRESH"}
+            </button>
+            <div style={{ position: "relative", minWidth: 280 }}>
+              <Search size={14} style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", color: "#6b7280" }} />
+              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Aktie suchen (jede US-Aktie)..."
+                style={{ width: "100%", background: "#111827", border: "1px solid #1f2937", padding: "10px 14px 10px 40px", color: "#e4e7ee", fontFamily: "inherit", fontSize: 12, borderRadius: 4, outline: "none", boxSizing: "border-box" }} />
+              {searching && (
+                <Loader2 size={12} color="#10b981" style={{ position: "absolute", right: 12, top: "50%", transform: "translateY(-50%)", animation: "spin 1s linear infinite" }} />
+              )}
+              {liveSearchResults.length > 0 && (
+                <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, background: "#111827", border: "1px solid #1f2937", borderRadius: 4, zIndex: 10, maxHeight: 320, overflowY: "auto" }}>
+                  {liveSearchResults.map(s => {
+                    const inDB = !!STOCK_DB[s.symbol];
+                    return (
+                      <div key={s.symbol} onClick={() => selectStock(s.symbol)}
+                        style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #1f2937", display: "flex", justifyContent: "space-between", fontSize: 12, alignItems: "center" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                        <div>
+                          <span style={{ fontWeight: 700, color: "#10b981" }}>{s.symbol}</span>
+                          <span style={{ color: "#6b7280", marginLeft: 10 }}>{s.name}</span>
+                        </div>
+                        {inDB ? (
+                          <span style={{ fontSize: 9, color: "#10b981", letterSpacing: 1, background: "rgba(16,185,129,0.1)", padding: "2px 6px", borderRadius: 3 }}>DB+LIVE</span>
+                        ) : (
+                          <span style={{ fontSize: 9, color: "#60a5fa", letterSpacing: 1 }}>LIVE</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
+        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
         <div style={{ maxWidth: 1400, margin: "16px auto 0", display: "flex", gap: 4, borderBottom: "1px solid #1f2937", marginBottom: -21, flexWrap: "wrap" }}>
           {[
             { id: "daily", label: "DAILY", icon: Zap },
@@ -249,11 +386,11 @@ export default function TradingApp() {
       <div style={{ maxWidth: 1400, margin: "0 auto", padding: "32px" }}>
         {tab === "daily" && <DailyTab stocks={dailyRanked} onSelect={(t) => { setSelectedStock(t); setTab("detail"); }} />}
         {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={(t) => { setSelectedStock(t); setTab("detail"); }} />}
-        {tab === "detail" && selectedStock && <DetailTab stock={STOCK_DB[selectedStock]} onLab={() => setTab("lab")} />}
-        {tab === "lab" && selectedStock && <AnalysisLab stock={STOCK_DB[selectedStock]} />}
+        {tab === "detail" && selectedStock && getEnrichedStock(selectedStock) && <DetailTab stock={getEnrichedStock(selectedStock)} onLab={() => setTab("lab")} />}
+        {tab === "lab" && selectedStock && getEnrichedStock(selectedStock) && <AnalysisLab stock={getEnrichedStock(selectedStock)} />}
 
         <div style={{ textAlign: "center", fontSize: 10, color: "#4b5563", letterSpacing: 2, padding: "32px 16px 16px" }}>
-          ◆ DEMO DATEN · ANALYSE-ENGINE VIA CLAUDE API · LIVE-MARKTDATEN IN PHASE 2 ◆
+          ◆ PHASE 2A · LIVE QUOTES via FINNHUB · ANALYSE-ENGINE VIA CLAUDE API ◆
         </div>
       </div>
     </div>
