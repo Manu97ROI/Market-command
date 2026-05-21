@@ -131,6 +131,20 @@ const getColor = (s) => s >= 70 ? "#10b981" : s >= 50 ? "#f59e0b" : "#ef4444";
 const getSignal = (s) => s >= 70 ? "STRONG" : s >= 55 ? "MODERATE" : s >= 40 ? "WEAK" : "AVOID";
 const formatNum = (n) => n >= 1000000 ? (n/1000000).toFixed(1) + "M" : n >= 1000 ? (n/1000).toFixed(1) + "K" : n.toString();
 
+// Smart Preis-Formatter: passt Nachkommastellen automatisch an Preishoehe an
+// Wichtig fuer Crypto: PEPE bei $0.000012 braucht 8 Stellen, BTC bei $96000 braucht 0
+const formatPrice = (p) => {
+  if (p == null || isNaN(p)) return "0";
+  const n = Number(p);
+  if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  if (n >= 10) return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (n >= 1) return n.toLocaleString("en-US", { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+  if (n >= 0.01) return n.toLocaleString("en-US", { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+  if (n >= 0.0001) return n.toLocaleString("en-US", { minimumFractionDigits: 6, maximumFractionDigits: 6 });
+  if (n > 0) return n.toLocaleString("en-US", { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+  return "0";
+};
+
 // ============================================
 // CLAUDE API WRAPPER fuer Analyse-Generierung
 // ============================================
@@ -503,7 +517,7 @@ function DailyTab({ stocks, onSelect }) {
             <div>
               <div style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{s.ticker}</div>
               <div style={{ fontSize: 10, color: "#6b7280" }}>{s.sector}</div>
-              <div style={{ fontSize: 13, marginTop: 4 }}>${s.price.toLocaleString()}</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>${formatPrice(s.price)}</div>
               <div style={{ fontSize: 11, color: s.change >= 0 ? "#10b981" : "#ef4444" }}>{s.change >= 0 ? "+" : ""}{s.change}%</div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, fontSize: 11 }}>
@@ -552,7 +566,7 @@ function LongTermTab({ stocks, onSelect }) {
             <div>
               <div style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{s.ticker}</div>
               <div style={{ fontSize: 10, color: "#6b7280" }}>{s.sector} · {s.marketCap}</div>
-              <div style={{ fontSize: 13, marginTop: 4 }}>${s.price.toLocaleString()}</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>${formatPrice(s.price)}</div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, fontSize: 11 }}>
               <div><div style={{ color: "#6b7280", marginBottom: 2 }}>EPS 5Y</div><div style={{ color: s.longterm.epsGrowth5Y > 0 ? "#10b981" : "#ef4444", fontWeight: 600 }}>{s.longterm.epsGrowth5Y}%</div></div>
@@ -593,7 +607,7 @@ function DetailTab({ stock: s, onLab }) {
             <div style={{ fontSize: 42, fontWeight: 700, color: "#10b981", lineHeight: 1.1, marginTop: 4 }}>{s.ticker}</div>
             <div style={{ fontSize: 13, color: "#9ca3af" }}>{s.name}</div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginTop: 12 }}>
-              <div style={{ fontSize: 28, fontWeight: 600 }}>${s.price.toLocaleString()}</div>
+              <div style={{ fontSize: 28, fontWeight: 600 }}>${formatPrice(s.price)}</div>
               <div style={{ fontSize: 13, color: s.change >= 0 ? "#10b981" : "#ef4444" }}>{s.change >= 0 ? "+" : ""}{s.change}%</div>
             </div>
           </div>
@@ -646,7 +660,7 @@ function DetailTab({ stock: s, onLab }) {
               </div>
               <div style={{ textAlign: "right" }}>
                 <div>{formatNum(w.shares)}</div>
-                <div style={{ fontSize: 10, color: "#6b7280" }}>@ ${w.avgPrice.toLocaleString()}</div>
+                <div style={{ fontSize: 10, color: "#6b7280" }}>@ ${formatPrice(w.avgPrice)}</div>
               </div>
               <div style={{ textAlign: "right", fontWeight: 700, color: w.action === "bought" ? "#10b981" : "#ef4444" }}>${w.value}</div>
               <div style={{ textAlign: "right", fontSize: 10, color: "#9ca3af" }}>{w.date}</div>
@@ -1206,7 +1220,7 @@ function ScenariosRender({ data, stock }) {
                 </div>
                 <div style={{ textAlign: "right" }}>
                   <div style={{ fontSize: 10, color: "#6b7280", letterSpacing: 1 }}>KURSZIEL</div>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: s.color }}>${s.data.priceTarget.toLocaleString()}</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: s.color }}>${formatPrice(s.data.priceTarget)}</div>
                   <div style={{ fontSize: 11, color: s.color }}>{change >= 0 ? "+" : ""}{change}%</div>
                 </div>
               </div>
