@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw } from "lucide-react";
 import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes } from "./finnhubClient.js";
+import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
 
 // ============================================
 // STOCK DATABASE mit erweitertem Kontext fuer LLM
@@ -63,7 +64,7 @@ const STOCK_DB = {
     context: "NVIDIAs einziger echter GPU-Rivale. MI350/MI400 Chips direkt gegen NVDA H100/B200. CPU Marktanteil waechst vs Intel. Kleinere Skala = mehr Volatilitaet, aber mehr Upside."
   },
   BTC: {
-    ticker: "BTC", name: "Bitcoin", price: 96420.00, change: 2.85, sector: "Crypto", marketCap: "1.9T",
+    ticker: "BTC", name: "Bitcoin", price: 96420.00, change: 2.85, sector: "Crypto", marketCap: "1.9T", assetType: "crypto",
     daily: { momentum: 82, gapPct: 1.8, preMarketVol: "high", intraDayRange: 3.2, volVsAvg: 1.65, catalyst: "ETF Inflows", catalystStrength: 85, breakoutProximity: 92, volatility: 68 },
     longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 85, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 78 },
     whales: [
@@ -73,8 +74,28 @@ const STOCK_DB = {
     ],
     context: "Digitales Gold Narrative. ETF-Inflows seit 2024 massiv. Halving-Cycle. Korrelation zu Tech-Aktien schwankt. Macro-Liquiditaet treibt den Kurs. Regulatorisches Risiko bleibt."
   },
+  ETH: {
+    ticker: "ETH", name: "Ethereum", price: 3850.00, change: 1.45, sector: "Crypto", marketCap: "465B", assetType: "crypto",
+    daily: { momentum: 68, gapPct: 1.2, preMarketVol: "high", intraDayRange: 2.8, volVsAvg: 1.35, catalyst: "L2 Wachstum", catalystStrength: 65, breakoutProximity: 72, volatility: 62 },
+    longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 82, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 75 },
+    whales: [
+      { name: "BlackRock ETHA", type: "institution", action: "bought", shares: 125000, avgPrice: 3780, value: "473M", date: "5d ago", confidence: "high" },
+      { name: "Fidelity FETH", type: "institution", action: "bought", shares: 82000, avgPrice: 3820, value: "313M", date: "1w ago", confidence: "high" }
+    ],
+    context: "Programmable Money + DeFi + L2 Ecosystem (Arbitrum, Optimism, Base). Staking nach Merge. ETH-ETFs seit Mitte 2024. Konkurrenz von SOL und anderen Layer-1s. EIP-1559 macht ETH deflationaer bei hohem Use."
+  },
+  SOL: {
+    ticker: "SOL", name: "Solana", price: 215.00, change: 4.25, sector: "Crypto", marketCap: "100B", assetType: "crypto",
+    daily: { momentum: 85, gapPct: 3.8, preMarketVol: "high", intraDayRange: 5.5, volVsAvg: 1.85, catalyst: "DEX Volume Peak", catalystStrength: 78, breakoutProximity: 88, volatility: 78 },
+    longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 68, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 82 },
+    whales: [
+      { name: "Jump Crypto", type: "hedge_fund", action: "bought", shares: 280000, avgPrice: 210, value: "59M", date: "4d ago", confidence: "high" },
+      { name: "DeFi Capital", type: "hedge_fund", action: "bought", shares: 150000, avgPrice: 212, value: "32M", date: "1w ago", confidence: "neutral" }
+    ],
+    context: "Schnellste Layer-1, niedrige Fees, hohes Memecoin- und DEX-Volume. Network-Outages der Vergangenheit historisch ueberwunden. SOL-ETF moeglicher Katalysator 2025/2026. Direkter ETH-Konkurrent."
+  },
   GOOGL: {
-    ticker: "GOOGL", name: "Alphabet Inc.", price: 198.45, change: 2.12, sector: "Technology", marketCap: "2.4T",
+    ticker: "GOOGL", name: "Alphabet Inc.", price: 198.45, change: 2.12, sector: "Technology", marketCap: "2.4T", assetType: "stock",
     daily: { momentum: 68, gapPct: 1.2, preMarketVol: "above_avg", intraDayRange: 2.4, volVsAvg: 1.25, catalyst: "Gemini 3 Launch", catalystStrength: 70, breakoutProximity: 78, volatility: 52 },
     longterm: { epsGrowth5Y: 22.4, revenueGrowth5Y: 18.2, moat: 90, debtToEquity: 0.12, roe: 32.5, fcfGrowth: 25.8, pe: 26.8, peg: 1.2, sectorTrend: 82 },
     whales: [
@@ -218,18 +239,27 @@ export default function TradingApp() {
 
   const allStocks = Object.values(STOCK_DB).map(s => getEnrichedStock(s.ticker)).filter(Boolean);
 
-  // Live-Quotes fuer alle Demo-Stocks holen
+  // Live-Quotes fuer alle Demo-Stocks holen (parallel: Stocks via Finnhub, Crypto via CoinGecko)
   const refreshQuotes = async () => {
     setRefreshing(true);
     try {
-      const symbols = Object.keys(STOCK_DB).filter(t => t !== "BTC"); // BTC nicht via Finnhub stock-quote
-      const quotes = await getMultipleQuotes(symbols);
+      const allTickers = Object.keys(STOCK_DB);
+      const stockTickers = allTickers.filter(t => STOCK_DB[t].assetType !== "crypto");
+      const cryptoTickers = allTickers.filter(t => STOCK_DB[t].assetType === "crypto");
+      
+      // Parallel beide APIs aufrufen
+      const [stockQuotes, cryptoQuotes] = await Promise.all([
+        getMultipleQuotes(stockTickers).catch(() => []),
+        getMultipleCryptoQuotes(cryptoTickers).catch(() => [])
+      ]);
+      
       const quoteMap = {};
-      quotes.forEach(q => {
+      [...stockQuotes, ...cryptoQuotes].forEach(q => {
         if (q.price && q.price > 0) {
           quoteMap[q.symbol] = { price: q.price, change: q.change || 0 };
         }
       });
+      
       setLiveQuotes(prev => ({ ...prev, ...quoteMap }));
       setApiStatus(Object.keys(quoteMap).length > 0 ? "ok" : "error");
       setLastRefresh(new Date());
@@ -246,7 +276,7 @@ export default function TradingApp() {
     refreshQuotes();
   }, []);
 
-  // Live-Suche mit Debounce
+  // Live-Suche mit Debounce: parallel Stocks + Crypto
   useEffect(() => {
     if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
     if (!query || query.length < 1) {
@@ -256,8 +286,22 @@ export default function TradingApp() {
     searchDebounceRef.current = setTimeout(async () => {
       setSearching(true);
       try {
-        const results = await searchSymbols(query);
-        setLiveSearchResults(results);
+        const [stockResults, cryptoResults] = await Promise.all([
+          searchSymbols(query).catch(() => []),
+          searchCrypto(query).catch(() => [])
+        ]);
+        
+        // Crypto-Resultate kennzeichnen
+        const taggedCrypto = cryptoResults.map(c => ({ ...c, assetType: "crypto" }));
+        const taggedStocks = stockResults.map(s => ({ ...s, assetType: "stock" }));
+        
+        // Crypto zuerst (oft was der User sucht wenn er crypto-Ticker eingibt)
+        const upperQ = query.toUpperCase();
+        const exactCrypto = taggedCrypto.filter(c => c.symbol === upperQ);
+        const otherCrypto = taggedCrypto.filter(c => c.symbol !== upperQ);
+        const combined = [...exactCrypto, ...taggedStocks.slice(0, 15), ...otherCrypto].slice(0, 20);
+        
+        setLiveSearchResults(combined);
       } catch (err) {
         console.error("Search failed:", err);
         setLiveSearchResults([]);
@@ -268,41 +312,77 @@ export default function TradingApp() {
     return () => { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
   }, [query]);
 
-  // Wenn neue Aktie ausgewaehlt die NICHT in STOCK_DB ist -> Live-Profil holen
-  const selectStock = async (ticker) => {
+  // Wenn neue Aktie/Coin ausgewaehlt die NICHT in STOCK_DB ist -> Live-Profil holen
+  const selectStock = async (ticker, hint = {}) => {
     setSelectedStock(ticker);
     setQuery("");
     setLiveSearchResults([]);
     setTab("detail");
     
     if (!STOCK_DB[ticker] && !liveStocks[ticker]) {
-      // Hole Live Quote + Profile
-      try {
-        const [quote, profile] = await Promise.all([
-          getQuote(ticker).catch(() => null),
-          getProfile(ticker).catch(() => null)
-        ]);
-        if (quote && profile && profile.name) {
-          // Erstelle minimales Stock-Objekt mit Live-Daten + neutralen Defaults
-          const newStock = {
-            ticker,
-            name: profile.name,
-            price: quote.price,
-            change: quote.change || 0,
-            sector: profile.sector || "Unknown",
-            marketCap: formatMarketCap(profile.marketCap),
-            // Neutrale Defaults fuer Scores (Demo-Felder bei unbekannten Aktien)
-            daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 50 },
-            longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0.5, roe: 10, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 50 },
-            whales: [],
-            context: `${profile.name} ist ein ${profile.sector || "Unbekannt"}-Unternehmen mit Sitz in ${profile.country || "USA"}. Live-Daten von Finnhub. Whale-Tracking und Fundamentals werden in Phase 2B angebunden.`,
-            _liveOnly: true
-          };
-          setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
-          setLiveQuotes(prev => ({ ...prev, [ticker]: { price: quote.price, change: quote.change || 0 } }));
+      const isCrypto = hint.assetType === "crypto" || isCryptoTicker(ticker);
+      
+      if (isCrypto) {
+        // Crypto via CoinGecko
+        try {
+          let profile;
+          if (hint.id) {
+            profile = await getCryptoProfile(hint.id);
+          } else {
+            // Fallback: nur Quote holen
+            const q = await getCryptoQuote(ticker);
+            profile = { ticker, name: hint.name || ticker, price: q.price, change: q.change, marketCap: q.marketCap };
+          }
+          
+          if (profile && profile.price) {
+            const newStock = {
+              ticker: profile.ticker || ticker,
+              name: profile.name || ticker,
+              price: profile.price,
+              change: profile.change || 0,
+              sector: "Crypto",
+              marketCap: formatCryptoMarketCap(profile.marketCap),
+              assetType: "crypto",
+              daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 60 },
+              longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 60 },
+              whales: [],
+              context: `${profile.name || ticker} ist eine Kryptowaehrung. ${profile.description || ""} Live-Daten von CoinGecko. Whale-Tracking fuer Crypto wird in Phase 2C angebunden (On-Chain-Daten).`,
+              _liveOnly: true
+            };
+            setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
+            setLiveQuotes(prev => ({ ...prev, [ticker]: { price: profile.price, change: profile.change || 0 } }));
+          }
+        } catch (err) {
+          console.error("Crypto laden fehlgeschlagen:", err);
         }
-      } catch (err) {
-        console.error("Stock laden fehlgeschlagen:", err);
+      } else {
+        // Aktien via Finnhub
+        try {
+          const [quote, profile] = await Promise.all([
+            getQuote(ticker).catch(() => null),
+            getProfile(ticker).catch(() => null)
+          ]);
+          if (quote && profile && profile.name) {
+            const newStock = {
+              ticker,
+              name: profile.name,
+              price: quote.price,
+              change: quote.change || 0,
+              sector: profile.sector || "Unknown",
+              marketCap: formatMarketCap(profile.marketCap),
+              assetType: "stock",
+              daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 50 },
+              longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0.5, roe: 10, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 50 },
+              whales: [],
+              context: `${profile.name} ist ein ${profile.sector || "Unbekannt"}-Unternehmen mit Sitz in ${profile.country || "USA"}. Live-Daten von Finnhub. Whale-Tracking und Fundamentals werden in Phase 2B angebunden.`,
+              _liveOnly: true
+            };
+            setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
+            setLiveQuotes(prev => ({ ...prev, [ticker]: { price: quote.price, change: quote.change || 0 } }));
+          }
+        } catch (err) {
+          console.error("Stock laden fehlgeschlagen:", err);
+        }
       }
     }
   };
@@ -344,17 +424,21 @@ export default function TradingApp() {
                 <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, background: "#111827", border: "1px solid #1f2937", borderRadius: 4, zIndex: 10, maxHeight: 320, overflowY: "auto" }}>
                   {liveSearchResults.map(s => {
                     const inDB = !!STOCK_DB[s.symbol];
+                    const isCrypto = s.assetType === "crypto";
                     return (
-                      <div key={s.symbol} onClick={() => selectStock(s.symbol)}
+                      <div key={`${s.assetType}-${s.symbol}-${s.id || ""}`} onClick={() => selectStock(s.symbol, s)}
                         style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #1f2937", display: "flex", justifyContent: "space-between", fontSize: 12, alignItems: "center" }}
                         onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
                         onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-                        <div>
-                          <span style={{ fontWeight: 700, color: "#10b981" }}>{s.symbol}</span>
-                          <span style={{ color: "#6b7280", marginLeft: 10 }}>{s.name}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          {s.thumb && <img src={s.thumb} alt="" style={{ width: 16, height: 16, borderRadius: "50%" }} />}
+                          <span style={{ fontWeight: 700, color: isCrypto ? "#f59e0b" : "#10b981" }}>{s.symbol}</span>
+                          <span style={{ color: "#6b7280" }}>{s.name}</span>
                         </div>
                         {inDB ? (
                           <span style={{ fontSize: 9, color: "#10b981", letterSpacing: 1, background: "rgba(16,185,129,0.1)", padding: "2px 6px", borderRadius: 3 }}>DB+LIVE</span>
+                        ) : isCrypto ? (
+                          <span style={{ fontSize: 9, color: "#f59e0b", letterSpacing: 1, background: "rgba(245,158,11,0.1)", padding: "2px 6px", borderRadius: 3 }}>CRYPTO</span>
                         ) : (
                           <span style={{ fontSize: 9, color: "#60a5fa", letterSpacing: 1 }}>LIVE</span>
                         )}
