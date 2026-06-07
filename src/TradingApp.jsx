@@ -1,9 +1,10 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
-import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown } from "lucide-react";
+import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown, Lock, LogOut } from "lucide-react";
 import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes } from "./finnhubClient.js";
 import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
 import { TOP_50_US, isInUniverse, getSector } from "./universe.js";
 import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } from "./watchlistStorage.js";
+import { getAuthToken, login, clearAuthToken } from "./authStorage.js";
 
 // ============================================
 // STOCK DATABASE mit erweitertem Kontext fuer LLM
@@ -152,9 +153,13 @@ const formatPrice = (p) => {
 // ============================================
 const callClaudeAPI = async (systemPrompt, userPrompt) => {
   try {
+    const token = getAuthToken();
     const response = await fetch("/api/gemini", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { 
+        "Content-Type": "application/json",
+        "x-auth-token": token || ""
+      },
       body: JSON.stringify({ systemPrompt, userPrompt })
     });
     
@@ -167,20 +172,16 @@ const callClaudeAPI = async (systemPrompt, userPrompt) => {
     const text = data.text || "";
     let clean = text.replace(/```json|```/g, "").trim();
     
-    // Versuche JSON zu parsen
     try {
       return JSON.parse(clean);
     } catch (parseErr) {
-      // Falls JSON unvollstaendig: versuche das letzte unvollstaendige Element abzuschneiden
       console.error("JSON Parse Fehler. Raw Response:", clean);
-      
-      // Trim am letzten gueltigen schliessenden Brace/Bracket
       const lastBrace = Math.max(clean.lastIndexOf("}"), clean.lastIndexOf("]"));
       if (lastBrace > 0) {
         try {
           return JSON.parse(clean.substring(0, lastBrace + 1));
         } catch (e) {
-          throw new Error(`Antwort war unvollstaendig. Die Analyse hat das Token-Limit ueberschritten. Bitte erneut versuchen.`);
+          throw new Error(`Antwort war unvollstaendig. Bitte erneut versuchen.`);
         }
       }
       throw new Error(`Antwort konnte nicht verarbeitet werden. Bitte erneut versuchen.`);
@@ -243,7 +244,125 @@ const ANALYSIS_LEVELS = [
 // ============================================
 // MAIN APP
 // ============================================
-export default function TradingApp() {
+// ============================================
+// AUTH WRAPPER - zeigt Login-Screen wenn nicht eingeloggt
+// ============================================
+export default function AppWithAuth() {
+  const [authed, setAuthed] = useState(() => !!getAuthToken());
+  
+  if (!authed) {
+    return <LoginScreen onSuccess={() => setAuthed(true)} />;
+  }
+  
+  return <TradingApp onLogout={() => { clearAuthToken(); setAuthed(false); }} />;
+}
+
+function LoginScreen({ onSuccess }) {
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  
+  const handleSubmit = async (e) => {
+    if (e) e.preventDefault();
+    if (!password) return;
+    setLoading(true);
+    setError(null);
+    const result = await login(password);
+    setLoading(false);
+    if (result.success) {
+      onSuccess();
+    } else {
+      setError(result.error || "Login fehlgeschlagen");
+      setPassword("");
+    }
+  };
+  
+  return (
+    <div style={{ minHeight: "100vh", background: "#0a0e1a", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, fontFamily: "'JetBrains Mono', 'SF Mono', monospace" }}>
+      <div style={{ width: "100%", maxWidth: 380, background: "#111827", border: "1px solid #1f2937", borderRadius: 8, padding: 32 }}>
+        
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+          <Lock size={14} color="#10b981" />
+          <div style={{ fontSize: 10, letterSpacing: 3, color: "#10b981", fontWeight: 600 }}>▲ AUTHENTICATION REQUIRED</div>
+        </div>
+        
+        <h1 style={{ fontSize: 24, fontWeight: 700, color: "#e4e7ee", margin: "0 0 8px 0", letterSpacing: -0.5 }}>
+          Market Command<span style={{ color: "#10b981" }}>.</span>
+        </h1>
+        
+        <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 28, lineHeight: 1.5 }}>
+          Geschuetzte Trading-Intelligence-Platform. Bitte Passwort eingeben.
+        </div>
+        
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 10, letterSpacing: 2, color: "#6b7280", marginBottom: 8 }}>PASSWORT</div>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
+            placeholder="••••••••"
+            autoFocus
+            disabled={loading}
+            style={{
+              width: "100%",
+              background: "#0a0e1a",
+              border: "1px solid " + (error ? "#ef4444" : "#1f2937"),
+              padding: "12px 14px",
+              color: "#e4e7ee",
+              fontFamily: "inherit",
+              fontSize: 14,
+              borderRadius: 4,
+              outline: "none",
+              boxSizing: "border-box",
+              letterSpacing: password ? 4 : 0
+            }}
+          />
+        </div>
+        
+        {error && (
+          <div style={{ padding: "10px 12px", background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 4, marginBottom: 16, fontSize: 11, color: "#ef4444", display: "flex", alignItems: "center", gap: 8 }}>
+            <AlertCircle size={12} />{error}
+          </div>
+        )}
+        
+        <button
+          onClick={handleSubmit}
+          disabled={!password || loading}
+          style={{
+            width: "100%",
+            background: password && !loading ? "#10b981" : "#1f2937",
+            color: password && !loading ? "#0a0e1a" : "#6b7280",
+            border: "none",
+            padding: "12px 16px",
+            fontFamily: "inherit",
+            fontSize: 12,
+            letterSpacing: 2,
+            fontWeight: 700,
+            borderRadius: 4,
+            cursor: password && !loading ? "pointer" : "not-allowed",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 8
+          }}>
+          {loading ? <><Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} />ANMELDEN...</> : <>EINLOGGEN →</>}
+        </button>
+        
+        <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px dashed #1f2937", fontSize: 10, color: "#4b5563", letterSpacing: 1, textAlign: "center" }}>
+          ◆ PROTECTED BY SERVER-SIDE AUTH ◆
+        </div>
+        
+        <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      </div>
+    </div>
+  );
+}
+
+// ============================================
+// MAIN APP (TradingApp)
+// ============================================
+function TradingApp({ onLogout }) {
   const [tab, setTab] = useState("daily");
   const [selectedStock, setSelectedStock] = useState(null);
   const [query, setQuery] = useState("");
@@ -545,6 +664,11 @@ export default function TradingApp() {
               style={{ background: "#111827", border: "1px solid #1f2937", color: "#e4e7ee", padding: "10px 14px", fontFamily: "inherit", fontSize: 11, letterSpacing: 1.5, fontWeight: 600, borderRadius: 4, cursor: refreshing ? "wait" : "pointer", display: "flex", alignItems: "center", gap: 6 }}>
               <RefreshCw size={12} style={{ animation: refreshing ? "spin 1s linear infinite" : "none" }} />
               {refreshing ? "LADEN..." : "REFRESH"}
+            </button>
+            <button onClick={onLogout}
+              title="Ausloggen"
+              style={{ background: "transparent", border: "1px solid #1f2937", color: "#6b7280", padding: "10px 12px", fontFamily: "inherit", fontSize: 11, letterSpacing: 1.5, fontWeight: 600, borderRadius: 4, cursor: "pointer", display: "flex", alignItems: "center" }}>
+              <LogOut size={12} />
             </button>
             <div style={{ position: "relative", minWidth: 280 }}>
               <Search size={14} style={{ position: "absolute", left: 14, top: "50%", transform: "translateY(-50%)", color: "#6b7280" }} />
