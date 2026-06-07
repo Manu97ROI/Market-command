@@ -152,26 +152,24 @@ const formatPrice = (p) => {
 // ============================================
 const callClaudeAPI = async (systemPrompt, userPrompt) => {
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetch("/api/gemini", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 2000,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userPrompt }]
-      })
+      body: JSON.stringify({ systemPrompt, userPrompt })
     });
+    
     if (!response.ok) {
-      throw new Error(`API noch nicht angebunden (Phase 2). Nutze "LOAD DEMO" um die App zu testen.`);
+      const errData = await response.json().catch(() => ({ error: "Unbekannter Fehler" }));
+      throw new Error(errData.error || `API noch nicht angebunden. Nutze "LOAD DEMO" um die App zu testen.`);
     }
+    
     const data = await response.json();
-    const text = data.content.map(c => c.text || "").join("\n");
+    const text = data.text || "";
     const clean = text.replace(/```json|```/g, "").trim();
     return JSON.parse(clean);
   } catch (err) {
     console.error("API Error:", err);
-    throw new Error(err.message || `API noch nicht angebunden (Phase 2). Nutze "LOAD DEMO" um die App zu testen.`);
+    throw new Error(err.message || `API noch nicht angebunden. Nutze "LOAD DEMO" um die App zu testen.`);
   }
 };
 
@@ -600,7 +598,7 @@ export default function TradingApp() {
         {tab === "lab" && selectedStock && getEnrichedStockByTicker(selectedStock) && <AnalysisLab stock={getEnrichedStockByTicker(selectedStock)} />}
 
         <div style={{ textAlign: "center", fontSize: 10, color: "#4b5563", letterSpacing: 2, padding: "32px 16px 16px" }}>
-          ◆ PHASE 2B · TOP 50 LIVE UNIVERSE · WATCHLIST · AUTO-REFRESH 60s ◆
+          ◆ PHASE 2C · LIVE UNIVERSE · WATCHLIST · ANALYSIS LAB via GEMINI ◆
         </div>
       </div>
     </div>
@@ -1221,7 +1219,7 @@ function AnalysisLab({ stock }) {
             )}
             <div style={{ textAlign: "right", paddingLeft: 8 }}>
               <div style={{ fontSize: 10, letterSpacing: 2, color: "#6b7280" }}>ENGINE</div>
-              <div style={{ fontSize: 12, color: "#10b981", fontWeight: 600, marginTop: 4 }}>Claude Sonnet 4</div>
+              <div style={{ fontSize: 12, color: "#10b981", fontWeight: 600, marginTop: 4 }}>Gemini 2.0 Flash</div>
             </div>
           </div>
         </div>
