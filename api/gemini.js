@@ -4,6 +4,7 @@
 
 export default async function handler(req, res) {
   const apiKey = process.env.GEMINI_API_KEY;
+  const expectedPassword = process.env.APP_PASSWORD;
   
   if (!apiKey) {
     return res.status(500).json({ error: "GEMINI_API_KEY ist nicht gesetzt in Vercel Environment Variables" });
@@ -11,6 +12,14 @@ export default async function handler(req, res) {
 
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Nur POST erlaubt" });
+  }
+  
+  // Auth-Check: nur authentifizierte User duerfen die teure Gemini-API nutzen
+  if (expectedPassword) {
+    const authToken = req.headers["x-auth-token"];
+    if (!authToken || authToken !== expectedPassword) {
+      return res.status(401).json({ error: "Nicht autorisiert. Bitte einloggen." });
+    }
   }
 
   const { systemPrompt, userPrompt, model = "gemini-flash-latest" } = req.body || {};
