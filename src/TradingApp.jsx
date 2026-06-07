@@ -165,8 +165,26 @@ const callClaudeAPI = async (systemPrompt, userPrompt) => {
     
     const data = await response.json();
     const text = data.text || "";
-    const clean = text.replace(/```json|```/g, "").trim();
-    return JSON.parse(clean);
+    let clean = text.replace(/```json|```/g, "").trim();
+    
+    // Versuche JSON zu parsen
+    try {
+      return JSON.parse(clean);
+    } catch (parseErr) {
+      // Falls JSON unvollstaendig: versuche das letzte unvollstaendige Element abzuschneiden
+      console.error("JSON Parse Fehler. Raw Response:", clean);
+      
+      // Trim am letzten gueltigen schliessenden Brace/Bracket
+      const lastBrace = Math.max(clean.lastIndexOf("}"), clean.lastIndexOf("]"));
+      if (lastBrace > 0) {
+        try {
+          return JSON.parse(clean.substring(0, lastBrace + 1));
+        } catch (e) {
+          throw new Error(`Antwort war unvollstaendig. Die Analyse hat das Token-Limit ueberschritten. Bitte erneut versuchen.`);
+        }
+      }
+      throw new Error(`Antwort konnte nicht verarbeitet werden. Bitte erneut versuchen.`);
+    }
   } catch (err) {
     console.error("API Error:", err);
     throw new Error(err.message || `API noch nicht angebunden. Nutze "LOAD DEMO" um die App zu testen.`);
