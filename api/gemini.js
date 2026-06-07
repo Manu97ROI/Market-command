@@ -13,7 +13,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Nur POST erlaubt" });
   }
 
-  const { systemPrompt, userPrompt, model = "gemini-2.0-flash" } = req.body || {};
+  const { systemPrompt, userPrompt, model = "gemini-flash-latest" } = req.body || {};
   
   if (!userPrompt) {
     return res.status(400).json({ error: "userPrompt fehlt" });
