@@ -32,8 +32,12 @@ export default async function handler(req, res) {
     ],
     generationConfig: {
       temperature: 0.7,
-      maxOutputTokens: 2048,
-      responseMimeType: "application/json"
+      maxOutputTokens: 4096,
+      responseMimeType: "application/json",
+      // Thinking-Mode deaktivieren - wir wollen direktes JSON ohne internes Reasoning
+      thinkingConfig: {
+        thinkingBudget: 0
+      }
     }
   };
   
