@@ -1,7 +1,9 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
-import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw } from "lucide-react";
+import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown } from "lucide-react";
 import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes } from "./finnhubClient.js";
 import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
+import { TOP_50_US, isInUniverse, getSector } from "./universe.js";
+import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } from "./watchlistStorage.js";
 
 // ============================================
 // STOCK DATABASE mit erweitertem Kontext fuer LLM
@@ -231,19 +233,54 @@ export default function TradingApp() {
   const [query, setQuery] = useState("");
   
   // Live-Daten-State
-  const [liveQuotes, setLiveQuotes] = useState({}); // { TICKER: { price, change, ... } }
-  const [liveStocks, setLiveStocks] = useState({}); // Aktien NICHT in STOCK_DB (Live-only)
+  const [liveQuotes, setLiveQuotes] = useState({});
+  const [liveStocks, setLiveStocks] = useState({});
   const [liveSearchResults, setLiveSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [apiStatus, setApiStatus] = useState("unknown"); // "ok" | "error" | "unknown"
+  const [apiStatus, setApiStatus] = useState("unknown");
   const [lastRefresh, setLastRefresh] = useState(null);
   const searchDebounceRef = useRef(null);
+  const autoRefreshRef = useRef(null);
+  
+  // Universe + Watchlist State
+  const [watchlist, setWatchlist] = useState(() => loadWatchlist());
+  const [dailySortMode, setDailySortMode] = useState("change"); // change | volume | score
+  const [loadedUniverseQuotes, setLoadedUniverseQuotes] = useState(0); // wie viele der 50 geladen sind
+
+  // Beim Watchlist-Update: hydraten was nicht in DB ist
+  useEffect(() => {
+    watchlist.forEach(ticker => {
+      if (!STOCK_DB[ticker] && !liveStocks[ticker]) {
+        hydrateStock(ticker);
+      }
+    });
+  }, [watchlist.length]);
 
   // Hilfsfunktion: Stock aus DB oder Live holen, mit Live-Quote merge
-  const getEnrichedStock = (ticker) => {
+  const getEnrichedStockByTicker = (ticker) => {
     const base = STOCK_DB[ticker] || liveStocks[ticker];
-    if (!base) return null;
+    if (!base) {
+      // Universe stock ohne Hydrate -> minimaler Eintrag aus Top 50
+      const universeEntry = TOP_50_US.find(s => s.ticker === ticker);
+      if (universeEntry) {
+        const liveQuote = liveQuotes[ticker];
+        return {
+          ticker,
+          name: universeEntry.name,
+          sector: universeEntry.sector,
+          marketCap: "—",
+          price: liveQuote?.price || 0,
+          change: liveQuote?.change || 0,
+          assetType: "stock",
+          daily: { momentum: 50, gapPct: liveQuote?.change || 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "—", catalystStrength: 30, breakoutProximity: 50, volatility: 50 },
+          longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0.5, roe: 10, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 50 },
+          whales: [],
+          _universeOnly: true
+        };
+      }
+      return null;
+    }
     const liveQuote = liveQuotes[ticker];
     if (liveQuote) {
       return { ...base, price: liveQuote.price, change: liveQuote.change, _live: true };
@@ -251,44 +288,117 @@ export default function TradingApp() {
     return base;
   };
 
-  const allStocks = Object.values(STOCK_DB).map(s => getEnrichedStock(s.ticker)).filter(Boolean);
+  // Daily Liste = Top 50 Universe + Crypto (BTC, ETH, SOL)
+  // Top 20 davon werden angezeigt, sortiert nach gewaehltem Modus
+  const dailyRanked = useMemo(() => {
+    const universeTickers = [...TOP_50_US.map(s => s.ticker), "BTC", "ETH", "SOL"];
+    const stocks = universeTickers
+      .map(t => getEnrichedStockByTicker(t))
+      .filter(s => s && s.price > 0); // nur die mit Quote
+    
+    const enriched = stocks.map(s => ({ ...s, score: calcDailyScore(s) }));
+    
+    // Sortieren je nach Modus
+    let sorted;
+    if (dailySortMode === "change") {
+      sorted = [...enriched].sort((a, b) => Math.abs(b.change || 0) - Math.abs(a.change || 0));
+    } else if (dailySortMode === "score") {
+      sorted = [...enriched].sort((a, b) => b.score - a.score);
+    } else {
+      sorted = [...enriched].sort((a, b) => Math.abs(b.change || 0) - Math.abs(a.change || 0));
+    }
+    
+    return sorted.slice(0, 20); // Top 20
+  }, [liveQuotes, dailySortMode, liveStocks]);
+  
+  // Long-Term bleibt erstmal aus STOCK_DB (Demo-Daten mit Fundamentals)
+  const longTermRanked = useMemo(() => {
+    const stocks = Object.values(STOCK_DB).map(s => getEnrichedStockByTicker(s.ticker)).filter(Boolean);
+    return stocks.map(s => ({ ...s, score: calcLongTermScore(s) })).sort((a, b) => b.score - a.score);
+  }, [liveQuotes, liveStocks]);
 
-  // Live-Quotes fuer alle Demo-Stocks holen (parallel: Stocks via Finnhub, Crypto via CoinGecko)
-  const refreshQuotes = async () => {
-    setRefreshing(true);
+  // Watchlist Stocks (mit Live-Quotes wenn vorhanden)
+  const watchlistStocks = useMemo(() => {
+    return watchlist
+      .map(t => getEnrichedStockByTicker(t))
+      .filter(Boolean)
+      .map(s => ({ ...s, score: calcDailyScore(s) }));
+  }, [watchlist, liveQuotes, liveStocks]);
+
+  // Hole Quotes fuer Universe (Top 50 US) + Crypto in Batches
+  // Batch 1 (25 Stocks) + Crypto -> ~26 Calls
+  // Batch 2 (25 Stocks) -> 25 Calls
+  // Total ~51 Calls, lassen 9 Calls/Min Buffer fuer Suche/Detail
+  const refreshQuotes = async (showSpinner = true) => {
+    if (showSpinner) setRefreshing(true);
+    setLoadedUniverseQuotes(0);
+    
     try {
-      const allTickers = Object.keys(STOCK_DB);
-      const stockTickers = allTickers.filter(t => STOCK_DB[t].assetType !== "crypto");
-      const cryptoTickers = allTickers.filter(t => STOCK_DB[t].assetType === "crypto");
+      const universeTickers = TOP_50_US.map(s => s.ticker);
+      const cryptoTickers = ["BTC", "ETH", "SOL"];
       
-      // Parallel beide APIs aufrufen
-      const [stockQuotes, cryptoQuotes] = await Promise.all([
-        getMultipleQuotes(stockTickers).catch(() => []),
+      // Batch 1: Erste 25 Stocks + Crypto (parallel)
+      const batch1Stocks = universeTickers.slice(0, 25);
+      const [batch1Results, cryptoQuotes] = await Promise.all([
+        getMultipleQuotes(batch1Stocks).catch(() => []),
         getMultipleCryptoQuotes(cryptoTickers).catch(() => [])
       ]);
       
-      const quoteMap = {};
-      [...stockQuotes, ...cryptoQuotes].forEach(q => {
-        if (q.price && q.price > 0) {
-          quoteMap[q.symbol] = { price: q.price, change: q.change || 0 };
-        }
+      // Quotes aus Batch 1 in State schreiben (sofort sichtbar)
+      const quoteMap1 = {};
+      [...batch1Results, ...cryptoQuotes].forEach(q => {
+        if (q.price && q.price > 0) quoteMap1[q.symbol] = { price: q.price, change: q.change || 0 };
       });
+      setLiveQuotes(prev => ({ ...prev, ...quoteMap1 }));
+      setLoadedUniverseQuotes(batch1Stocks.length);
       
-      setLiveQuotes(prev => ({ ...prev, ...quoteMap }));
-      setApiStatus(Object.keys(quoteMap).length > 0 ? "ok" : "error");
+      // Batch 2: Restliche 25 Stocks (sequentiell zur Batch 1 um Limits zu schonen)
+      const batch2Stocks = universeTickers.slice(25);
+      const batch2Results = await getMultipleQuotes(batch2Stocks).catch(() => []);
+      
+      const quoteMap2 = {};
+      batch2Results.forEach(q => {
+        if (q.price && q.price > 0) quoteMap2[q.symbol] = { price: q.price, change: q.change || 0 };
+      });
+      setLiveQuotes(prev => ({ ...prev, ...quoteMap2 }));
+      setLoadedUniverseQuotes(50);
+      
+      const totalLoaded = Object.keys({ ...quoteMap1, ...quoteMap2 }).length;
+      setApiStatus(totalLoaded > 0 ? "ok" : "error");
       setLastRefresh(new Date());
     } catch (err) {
       console.error("Refresh fehlgeschlagen:", err);
       setApiStatus("error");
     } finally {
-      setRefreshing(false);
+      if (showSpinner) setRefreshing(false);
     }
   };
 
-  // Beim ersten Laden: Quotes refreshen
+  // Beim ersten Laden: Quotes refreshen + Auto-Refresh alle 60 Sekunden
   useEffect(() => {
     refreshQuotes();
+    autoRefreshRef.current = setInterval(() => {
+      refreshQuotes(false); // ohne Spinner, im Hintergrund
+    }, 60 * 1000); // 60 Sekunden
+    return () => { if (autoRefreshRef.current) clearInterval(autoRefreshRef.current); };
   }, []);
+
+  // Watchlist Toggle (hinzufuegen/entfernen)
+  const toggleWatchlist = (ticker) => {
+    if (watchlist.includes(ticker)) {
+      const updated = removeFromWatchlist(ticker);
+      setWatchlist(updated);
+    } else {
+      const updated = addToWatchlist(ticker);
+      setWatchlist(updated);
+      // Wenn Aktie nicht in DB ist, hole Live-Daten damit sie in der Watchlist gerendert wird
+      if (!STOCK_DB[ticker] && !liveStocks[ticker]) {
+        hydrateStock(ticker);
+      }
+    }
+  };
+
+  const isInWl = (ticker) => watchlist.includes(ticker);
 
   // Live-Suche mit Debounce: parallel Stocks + Crypto
   useEffect(() => {
@@ -326,83 +436,76 @@ export default function TradingApp() {
     return () => { if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current); };
   }, [query]);
 
-  // Wenn neue Aktie/Coin ausgewaehlt die NICHT in STOCK_DB ist -> Live-Profil holen
+  // Hilfsfunktion: hole Live-Profil fuer eine Aktie/Coin und cache es
+  const hydrateStock = async (ticker, hint = {}) => {
+    if (STOCK_DB[ticker] || liveStocks[ticker]) return; // schon vorhanden
+    
+    const isCrypto = hint.assetType === "crypto" || isCryptoTicker(ticker);
+    
+    if (isCrypto) {
+      try {
+        let profile;
+        if (hint.id) {
+          profile = await getCryptoProfile(hint.id);
+        } else {
+          const q = await getCryptoQuote(ticker);
+          profile = { ticker, name: hint.name || ticker, price: q.price, change: q.change, marketCap: q.marketCap };
+        }
+        if (profile && profile.price) {
+          const newStock = {
+            ticker: profile.ticker || ticker,
+            name: profile.name || ticker,
+            price: profile.price,
+            change: profile.change || 0,
+            sector: "Crypto",
+            marketCap: formatCryptoMarketCap(profile.marketCap),
+            assetType: "crypto",
+            daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 60 },
+            longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 60 },
+            whales: [],
+            context: `${profile.name || ticker} ist eine Kryptowaehrung. ${profile.description || ""} Live-Daten von CoinGecko.`,
+            _liveOnly: true
+          };
+          setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
+          setLiveQuotes(prev => ({ ...prev, [ticker]: { price: profile.price, change: profile.change || 0 } }));
+        }
+      } catch (err) { console.error("Crypto hydrate failed:", err); }
+    } else {
+      try {
+        const [quote, profile] = await Promise.all([
+          getQuote(ticker).catch(() => null),
+          getProfile(ticker).catch(() => null)
+        ]);
+        if (quote && profile && profile.name) {
+          const newStock = {
+            ticker,
+            name: profile.name,
+            price: quote.price,
+            change: quote.change || 0,
+            sector: profile.sector || "Unknown",
+            marketCap: formatMarketCap(profile.marketCap),
+            assetType: "stock",
+            daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 50 },
+            longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0.5, roe: 10, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 50 },
+            whales: [],
+            context: `${profile.name} ist ein ${profile.sector || "Unbekannt"}-Unternehmen. Live-Daten von Finnhub.`,
+            _liveOnly: true
+          };
+          setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
+          setLiveQuotes(prev => ({ ...prev, [ticker]: { price: quote.price, change: quote.change || 0 } }));
+        }
+      } catch (err) { console.error("Stock hydrate failed:", err); }
+    }
+  };
+
+  // Wenn neue Aktie/Coin ausgewaehlt -> Detail oeffnen + ggf. hydraten
   const selectStock = async (ticker, hint = {}) => {
     setSelectedStock(ticker);
     setQuery("");
     setLiveSearchResults([]);
     setTab("detail");
-    
-    if (!STOCK_DB[ticker] && !liveStocks[ticker]) {
-      const isCrypto = hint.assetType === "crypto" || isCryptoTicker(ticker);
-      
-      if (isCrypto) {
-        // Crypto via CoinGecko
-        try {
-          let profile;
-          if (hint.id) {
-            profile = await getCryptoProfile(hint.id);
-          } else {
-            // Fallback: nur Quote holen
-            const q = await getCryptoQuote(ticker);
-            profile = { ticker, name: hint.name || ticker, price: q.price, change: q.change, marketCap: q.marketCap };
-          }
-          
-          if (profile && profile.price) {
-            const newStock = {
-              ticker: profile.ticker || ticker,
-              name: profile.name || ticker,
-              price: profile.price,
-              change: profile.change || 0,
-              sector: "Crypto",
-              marketCap: formatCryptoMarketCap(profile.marketCap),
-              assetType: "crypto",
-              daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 60 },
-              longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 60 },
-              whales: [],
-              context: `${profile.name || ticker} ist eine Kryptowaehrung. ${profile.description || ""} Live-Daten von CoinGecko. Whale-Tracking fuer Crypto wird in Phase 2C angebunden (On-Chain-Daten).`,
-              _liveOnly: true
-            };
-            setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
-            setLiveQuotes(prev => ({ ...prev, [ticker]: { price: profile.price, change: profile.change || 0 } }));
-          }
-        } catch (err) {
-          console.error("Crypto laden fehlgeschlagen:", err);
-        }
-      } else {
-        // Aktien via Finnhub
-        try {
-          const [quote, profile] = await Promise.all([
-            getQuote(ticker).catch(() => null),
-            getProfile(ticker).catch(() => null)
-          ]);
-          if (quote && profile && profile.name) {
-            const newStock = {
-              ticker,
-              name: profile.name,
-              price: quote.price,
-              change: quote.change || 0,
-              sector: profile.sector || "Unknown",
-              marketCap: formatMarketCap(profile.marketCap),
-              assetType: "stock",
-              daily: { momentum: 50, gapPct: 0, preMarketVol: "avg", intraDayRange: 0, volVsAvg: 1, catalyst: "Live-Daten", catalystStrength: 30, breakoutProximity: 50, volatility: 50 },
-              longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 50, debtToEquity: 0.5, roe: 10, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 50 },
-              whales: [],
-              context: `${profile.name} ist ein ${profile.sector || "Unbekannt"}-Unternehmen mit Sitz in ${profile.country || "USA"}. Live-Daten von Finnhub. Whale-Tracking und Fundamentals werden in Phase 2B angebunden.`,
-              _liveOnly: true
-            };
-            setLiveStocks(prev => ({ ...prev, [ticker]: newStock }));
-            setLiveQuotes(prev => ({ ...prev, [ticker]: { price: quote.price, change: quote.change || 0 } }));
-          }
-        } catch (err) {
-          console.error("Stock laden fehlgeschlagen:", err);
-        }
-      }
-    }
+    await hydrateStock(ticker, hint);
   };
-
-  const dailyRanked = useMemo(() => allStocks.map(s => ({ ...s, score: calcDailyScore(s) })).sort((a,b) => b.score - a.score), [liveQuotes]);
-  const longTermRanked = useMemo(() => allStocks.map(s => ({ ...s, score: calcLongTermScore(s) })).sort((a,b) => b.score - a.score), [liveQuotes]);
 
   return (
     <div style={{ minHeight: "100vh", background: "#0a0e1a", color: "#e4e7ee", fontFamily: "'JetBrains Mono', 'SF Mono', monospace" }}>
@@ -439,23 +542,30 @@ export default function TradingApp() {
                   {liveSearchResults.map(s => {
                     const inDB = !!STOCK_DB[s.symbol];
                     const isCrypto = s.assetType === "crypto";
+                    const inWL = watchlist.includes(s.symbol);
                     return (
-                      <div key={`${s.assetType}-${s.symbol}-${s.id || ""}`} onClick={() => selectStock(s.symbol, s)}
-                        style={{ padding: "10px 14px", cursor: "pointer", borderBottom: "1px solid #1f2937", display: "flex", justifyContent: "space-between", fontSize: 12, alignItems: "center" }}
-                        onMouseEnter={e => e.currentTarget.style.background = "#1f2937"}
-                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div key={`${s.assetType}-${s.symbol}-${s.id || ""}`}
+                        style={{ padding: "10px 14px", borderBottom: "1px solid #1f2937", display: "flex", justifyContent: "space-between", fontSize: 12, alignItems: "center", gap: 8 }}>
+                        <div onClick={() => selectStock(s.symbol, s)}
+                          style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flex: 1 }}>
                           {s.thumb && <img src={s.thumb} alt="" style={{ width: 16, height: 16, borderRadius: "50%" }} />}
                           <span style={{ fontWeight: 700, color: isCrypto ? "#f59e0b" : "#10b981" }}>{s.symbol}</span>
                           <span style={{ color: "#6b7280" }}>{s.name}</span>
                         </div>
-                        {inDB ? (
-                          <span style={{ fontSize: 9, color: "#10b981", letterSpacing: 1, background: "rgba(16,185,129,0.1)", padding: "2px 6px", borderRadius: 3 }}>DB+LIVE</span>
-                        ) : isCrypto ? (
-                          <span style={{ fontSize: 9, color: "#f59e0b", letterSpacing: 1, background: "rgba(245,158,11,0.1)", padding: "2px 6px", borderRadius: 3 }}>CRYPTO</span>
-                        ) : (
-                          <span style={{ fontSize: 9, color: "#60a5fa", letterSpacing: 1 }}>LIVE</span>
-                        )}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          {inDB ? (
+                            <span style={{ fontSize: 9, color: "#10b981", letterSpacing: 1, background: "rgba(16,185,129,0.1)", padding: "2px 6px", borderRadius: 3 }}>DB</span>
+                          ) : isCrypto ? (
+                            <span style={{ fontSize: 9, color: "#f59e0b", letterSpacing: 1, background: "rgba(245,158,11,0.1)", padding: "2px 6px", borderRadius: 3 }}>CRYPTO</span>
+                          ) : (
+                            <span style={{ fontSize: 9, color: "#60a5fa", letterSpacing: 1 }}>LIVE</span>
+                          )}
+                          <button onClick={(e) => { e.stopPropagation(); toggleWatchlist(s.symbol); }}
+                            title={inWL ? "Aus Watchlist entfernen" : "Zur Watchlist hinzufuegen"}
+                            style={{ background: "transparent", border: "1px solid " + (inWL ? "#f59e0b" : "#1f2937"), color: inWL ? "#f59e0b" : "#6b7280", padding: "4px 6px", borderRadius: 3, cursor: "pointer", display: "flex", alignItems: "center" }}>
+                            {inWL ? <Star size={10} fill="#f59e0b" /> : <Plus size={10} />}
+                          </button>
+                        </div>
                       </div>
                     );
                   })}
@@ -468,6 +578,7 @@ export default function TradingApp() {
         <div style={{ maxWidth: 1400, margin: "16px auto 0", display: "flex", gap: 4, borderBottom: "1px solid #1f2937", marginBottom: -21, flexWrap: "wrap" }}>
           {[
             { id: "daily", label: "DAILY", icon: Zap },
+            { id: "watchlist", label: `WATCHLIST${watchlist.length > 0 ? ` (${watchlist.length})` : ""}`, icon: Star },
             { id: "longterm", label: "LONG-TERM", icon: Anchor },
             { id: "detail", label: "DEEP DIVE", icon: Target, disabled: !selectedStock },
             { id: "lab", label: "ANALYSIS LAB", icon: Brain, disabled: !selectedStock }
@@ -482,13 +593,14 @@ export default function TradingApp() {
       </div>
 
       <div style={{ maxWidth: 1400, margin: "0 auto", padding: "32px" }}>
-        {tab === "daily" && <DailyTab stocks={dailyRanked} onSelect={(t) => { setSelectedStock(t); setTab("detail"); }} />}
-        {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={(t) => { setSelectedStock(t); setTab("detail"); }} />}
-        {tab === "detail" && selectedStock && getEnrichedStock(selectedStock) && <DetailTab stock={getEnrichedStock(selectedStock)} onLab={() => setTab("lab")} />}
-        {tab === "lab" && selectedStock && getEnrichedStock(selectedStock) && <AnalysisLab stock={getEnrichedStock(selectedStock)} />}
+        {tab === "daily" && <DailyTab stocks={dailyRanked} onSelect={selectStock} sortMode={dailySortMode} setSortMode={setDailySortMode} loadedCount={loadedUniverseQuotes} totalCount={50} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
+        {tab === "watchlist" && <WatchlistTab stocks={watchlistStocks} onSelect={selectStock} onToggleWatchlist={toggleWatchlist} />}
+        {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={selectStock} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
+        {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} />}
+        {tab === "lab" && selectedStock && getEnrichedStockByTicker(selectedStock) && <AnalysisLab stock={getEnrichedStockByTicker(selectedStock)} />}
 
         <div style={{ textAlign: "center", fontSize: 10, color: "#4b5563", letterSpacing: 2, padding: "32px 16px 16px" }}>
-          ◆ PHASE 2A · LIVE QUOTES via FINNHUB · ANALYSE-ENGINE VIA CLAUDE API ◆
+          ◆ PHASE 2B · TOP 50 LIVE UNIVERSE · WATCHLIST · AUTO-REFRESH 60s ◆
         </div>
       </div>
     </div>
@@ -496,49 +608,175 @@ export default function TradingApp() {
 }
 
 // ============================================
-// DAILY TAB
+// DAILY TAB - Top 20 aus Top 50 + Crypto Universe
 // ============================================
-function DailyTab({ stocks, onSelect }) {
+function DailyTab({ stocks, onSelect, sortMode, setSortMode, loadedCount, totalCount, watchlist, onToggleWatchlist }) {
+  const loading = loadedCount < totalCount;
+  
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <Flame size={18} color="#f59e0b" />
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>Heutige Trading-Chancen</div>
+            <div style={{ fontSize: 11, color: "#6b7280" }}>
+              {loading ? `Lade Universe... ${loadedCount}/${totalCount}` : `Top 20 aus ${totalCount} US-Aktien + Crypto`}
+            </div>
+          </div>
+        </div>
+        
+        {/* SORT TOGGLE */}
+        <div style={{ display: "flex", gap: 4, background: "#111827", border: "1px solid #1f2937", borderRadius: 4, padding: 3 }}>
+          {[
+            { id: "change", label: "BEWEGUNG", icon: TrendingUp },
+            { id: "score", label: "DAILY SCORE", icon: Activity }
+          ].map(opt => (
+            <button key={opt.id} onClick={() => setSortMode(opt.id)}
+              style={{ background: sortMode === opt.id ? "#1f2937" : "transparent", color: sortMode === opt.id ? "#10b981" : "#9ca3af", border: "none", padding: "6px 10px", fontFamily: "inherit", fontSize: 10, letterSpacing: 1.5, fontWeight: 600, borderRadius: 3, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+              <opt.icon size={10} />{opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gap: 10 }}>
+        {stocks.map((s, i) => {
+          const inWL = watchlist.includes(s.ticker);
+          const isPositive = s.change >= 0;
+          return (
+            <div key={s.ticker}
+              style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 16, display: "grid", gridTemplateColumns: "32px 130px 1fr auto", gap: 16, alignItems: "center", transition: "border-color 0.2s" }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = "#10b981"}
+              onMouseLeave={e => e.currentTarget.style.borderColor = "#1f2937"}>
+              
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#374151", textAlign: "center" }}>#{i+1}</div>
+              
+              <div onClick={() => onSelect(s.ticker)} style={{ cursor: "pointer" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 16, fontWeight: 700, color: s.assetType === "crypto" ? "#f59e0b" : "#10b981" }}>{s.ticker}</span>
+                  {s._live && <Wifi size={9} color="#10b981" />}
+                </div>
+                <div style={{ fontSize: 9, color: "#6b7280", marginTop: 2 }}>{s.sector}</div>
+                <div style={{ fontSize: 12, marginTop: 4, fontWeight: 600 }}>${formatPrice(s.price)}</div>
+              </div>
+
+              {/* DREI METRIKEN SICHTBAR */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, fontSize: 11 }}>
+                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>BEWEGUNG 24H</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: isPositive ? "#10b981" : "#ef4444", display: "flex", alignItems: "center", gap: 4 }}>
+                    {isPositive ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
+                    {isPositive ? "+" : ""}{(s.change || 0).toFixed(2)}%
+                  </div>
+                </div>
+                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>VOL vs AVG</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: "#9ca3af" }}>{s.daily?.volVsAvg || "1.0"}x</div>
+                </div>
+                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>DAILY SCORE</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: getColor(s.score) }}>{s.score}</div>
+                </div>
+              </div>
+
+              {/* ACTIONS */}
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <button onClick={(e) => { e.stopPropagation(); onToggleWatchlist(s.ticker); }}
+                  title={inWL ? "Aus Watchlist entfernen" : "Zur Watchlist hinzufuegen"}
+                  style={{ background: "transparent", border: "1px solid " + (inWL ? "#f59e0b" : "#1f2937"), color: inWL ? "#f59e0b" : "#6b7280", padding: 6, borderRadius: 3, cursor: "pointer", display: "flex", alignItems: "center" }}>
+                  {inWL ? <Star size={12} fill="#f59e0b" /> : <Star size={12} />}
+                </button>
+                <button onClick={() => onSelect(s.ticker)}
+                  style={{ background: "#1f2937", border: "none", color: "#10b981", padding: "6px 10px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 10, fontWeight: 600, letterSpacing: 1 }}>
+                  DETAILS →
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      
+      {stocks.length === 0 && !loading && (
+        <div style={{ textAlign: "center", padding: "60px 20px", color: "#6b7280", fontSize: 12 }}>
+          <Loader2 size={24} style={{ margin: "0 auto 12px", animation: "spin 1s linear infinite" }} />
+          Lade Marktdaten...
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================
+// WATCHLIST TAB - Deine persoenliche Auswahl
+// ============================================
+function WatchlistTab({ stocks, onSelect, onToggleWatchlist }) {
+  if (stocks.length === 0) {
+    return (
+      <div style={{ textAlign: "center", padding: "80px 20px", color: "#6b7280" }}>
+        <Star size={32} style={{ margin: "0 auto 16px", opacity: 0.4 }} />
+        <div style={{ fontSize: 14, fontWeight: 600, color: "#9ca3af", marginBottom: 8 }}>Deine Watchlist ist leer</div>
+        <div style={{ fontSize: 12, color: "#6b7280", maxWidth: 400, margin: "0 auto", lineHeight: 1.6 }}>
+          Such oben nach einer Aktie oder Coin und klick auf das <Plus size={11} style={{ display: "inline", verticalAlign: "middle" }} />-Symbol — oder klick auf den Stern in der Daily-Liste. Deine Auswahl wird im Browser gespeichert.
+        </div>
+      </div>
+    );
+  }
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-        <Flame size={18} color="#f59e0b" />
+        <Star size={18} color="#f59e0b" fill="#f59e0b" />
         <div>
-          <div style={{ fontSize: 16, fontWeight: 700 }}>Heutige Trading-Chancen</div>
-          <div style={{ fontSize: 11, color: "#6b7280" }}>Sortiert nach Momentum, Catalyst-Staerke, Breakout-Proximity</div>
+          <div style={{ fontSize: 16, fontWeight: 700 }}>Deine Watchlist</div>
+          <div style={{ fontSize: 11, color: "#6b7280" }}>{stocks.length} Aktien & Coins — wird im Browser gespeichert</div>
         </div>
       </div>
-      <div style={{ display: "grid", gap: 12 }}>
-        {stocks.map((s, i) => (
-          <div key={s.ticker} onClick={() => onSelect(s.ticker)}
-            style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 20, cursor: "pointer", display: "grid", gridTemplateColumns: "40px 140px 1fr auto 120px", gap: 20, alignItems: "center" }}
-            onMouseEnter={e => e.currentTarget.style.borderColor = "#10b981"} onMouseLeave={e => e.currentTarget.style.borderColor = "#1f2937"}>
-            <div style={{ fontSize: 24, fontWeight: 700, color: "#374151" }}>#{i+1}</div>
-            <div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{s.ticker}</div>
-              <div style={{ fontSize: 10, color: "#6b7280" }}>{s.sector}</div>
-              <div style={{ fontSize: 13, marginTop: 4 }}>${formatPrice(s.price)}</div>
-              <div style={{ fontSize: 11, color: s.change >= 0 ? "#10b981" : "#ef4444" }}>{s.change >= 0 ? "+" : ""}{s.change}%</div>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, fontSize: 11 }}>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>MOMENTUM</div><div style={{ color: getColor(s.daily.momentum), fontWeight: 600 }}>{s.daily.momentum}</div></div>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>VOL vs AVG</div><div style={{ fontWeight: 600 }}>{s.daily.volVsAvg}x</div></div>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>BREAKOUT</div><div style={{ color: getColor(s.daily.breakoutProximity), fontWeight: 600 }}>{s.daily.breakoutProximity}%</div></div>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>CATALYST</div><div style={{ fontWeight: 600, fontSize: 10 }}>{s.daily.catalyst}</div></div>
-            </div>
-            <div style={{ textAlign: "center" }}>
-              {s.daily.catalystStrength > 60 && (
-                <div style={{ padding: "4px 10px", background: "rgba(245,158,11,0.1)", color: "#f59e0b", fontSize: 9, fontWeight: 700, letterSpacing: 1, borderRadius: 3, border: "1px solid rgba(245,158,11,0.3)" }}>
-                  <Flame size={10} style={{ display: "inline", marginRight: 4, verticalAlign: "middle" }} />HOT
+      <div style={{ display: "grid", gap: 10 }}>
+        {stocks.map(s => {
+          const isPositive = s.change >= 0;
+          return (
+            <div key={s.ticker}
+              style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 16, display: "grid", gridTemplateColumns: "130px 1fr auto", gap: 16, alignItems: "center" }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = "#10b981"}
+              onMouseLeave={e => e.currentTarget.style.borderColor = "#1f2937"}>
+              <div onClick={() => onSelect(s.ticker)} style={{ cursor: "pointer" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 16, fontWeight: 700, color: s.assetType === "crypto" ? "#f59e0b" : "#10b981" }}>{s.ticker}</span>
+                  {s._live && <Wifi size={9} color="#10b981" />}
                 </div>
-              )}
+                <div style={{ fontSize: 9, color: "#6b7280", marginTop: 2 }}>{s.sector}</div>
+                <div style={{ fontSize: 12, marginTop: 4, fontWeight: 600 }}>${formatPrice(s.price)}</div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, fontSize: 11 }}>
+                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>BEWEGUNG 24H</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: isPositive ? "#10b981" : "#ef4444" }}>
+                    {isPositive ? "+" : ""}{(s.change || 0).toFixed(2)}%
+                  </div>
+                </div>
+                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>SECTOR</div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "#9ca3af" }}>{s.sector || "—"}</div>
+                </div>
+                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>DAILY SCORE</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: getColor(s.score) }}>{s.score}</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <button onClick={(e) => { e.stopPropagation(); onToggleWatchlist(s.ticker); }}
+                  title="Aus Watchlist entfernen"
+                  style={{ background: "transparent", border: "1px solid #f59e0b", color: "#f59e0b", padding: 6, borderRadius: 3, cursor: "pointer", display: "flex", alignItems: "center" }}>
+                  <Star size={12} fill="#f59e0b" />
+                </button>
+                <button onClick={() => onSelect(s.ticker)}
+                  style={{ background: "#1f2937", border: "none", color: "#10b981", padding: "6px 10px", borderRadius: 3, cursor: "pointer", fontFamily: "inherit", fontSize: 10, fontWeight: 600, letterSpacing: 1 }}>
+                  DETAILS →
+                </button>
+              </div>
             </div>
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: 32, fontWeight: 700, color: getColor(s.score), lineHeight: 1 }}>{s.score}</div>
-              <div style={{ fontSize: 9, letterSpacing: 2, color: getColor(s.score), fontWeight: 600, marginTop: 4 }}>{getSignal(s.score)}</div>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -589,7 +827,7 @@ function LongTermTab({ stocks, onSelect }) {
 // ============================================
 // DETAIL TAB
 // ============================================
-function DetailTab({ stock: s, onLab }) {
+function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist }) {
   const dailyScore = calcDailyScore(s);
   const longScore = calcLongTermScore(s);
   const whaleScore = calcWhaleScore(s.whales);
@@ -615,6 +853,12 @@ function DetailTab({ stock: s, onLab }) {
             <ScoreCard label="DAILY" icon={Zap} score={dailyScore} />
             <ScoreCard label="LONG-TERM" icon={Anchor} score={longScore} />
             <ScoreCard label="WHALE SENTIMENT" icon={Fish} score={whaleScore} />
+            <button onClick={onToggleWatchlist}
+              title={isWatched ? "Aus Watchlist entfernen" : "Zur Watchlist hinzufuegen"}
+              style={{ background: isWatched ? "rgba(245,158,11,0.15)" : "transparent", border: "1px solid " + (isWatched ? "rgba(245,158,11,0.5)" : "#1f2937"), borderRadius: 4, padding: "12px 14px", color: isWatched ? "#f59e0b" : "#9ca3af", fontFamily: "inherit", fontSize: 11, letterSpacing: 2, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, height: "fit-content" }}>
+              <Star size={14} fill={isWatched ? "#f59e0b" : "none"} />
+              {isWatched ? "GESPEICHERT" : "WATCHLIST"}
+            </button>
             <button onClick={onLab} style={{ background: "linear-gradient(135deg, rgba(16,185,129,0.15), rgba(96,165,250,0.15))", border: "1px solid rgba(16,185,129,0.4)", borderRadius: 4, padding: "12px 16px", color: "#10b981", fontFamily: "inherit", fontSize: 11, letterSpacing: 2, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, height: "fit-content" }}>
               <Brain size={14} />ANALYSIS LAB<Sparkles size={12} color="#f59e0b" />
             </button>
