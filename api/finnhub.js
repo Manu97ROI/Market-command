@@ -16,7 +16,7 @@ export default async function handler(req, res) {
   }
 
   // Whitelist erlaubter Endpoints (Sicherheit)
-  const allowedEndpoints = ["quote", "stock/profile2", "stock/symbol", "stock/metric", "stock/insider-transactions", "stock/recommendation", "company-news", "news-sentiment"];
+  const allowedEndpoints = ["quote", "stock/profile2", "stock/symbol", "stock/metric", "stock/insider-transactions", "stock/recommendation", "company-news", "news-sentiment", "stock/candle"];
   if (!allowedEndpoints.includes(endpoint)) {
     return res.status(400).json({ error: `Endpoint nicht erlaubt: ${endpoint}` });
   }
