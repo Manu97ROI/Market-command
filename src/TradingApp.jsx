@@ -1,10 +1,11 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown, Lock, LogOut } from "lucide-react";
-import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes } from "./finnhubClient.js";
+import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles } from "./finnhubClient.js";
 import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
 import { TOP_50_US, isInUniverse, getSector } from "./universe.js";
 import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } from "./watchlistStorage.js";
 import { getAuthToken, login, clearAuthToken } from "./authStorage.js";
+import { calcAllMetrics, calcLiveDailyScore, formatRange, formatRangePosition, formatRangeMultiplier, formatMomentum } from "./dayTradingMetrics.js";
 
 // ============================================
 // STOCK DATABASE mit erweitertem Kontext fuer LLM
@@ -368,7 +369,9 @@ function TradingApp({ onLogout }) {
   const [query, setQuery] = useState("");
   
   // Live-Daten-State
-  const [liveQuotes, setLiveQuotes] = useState({});
+  const [liveQuotes, setLiveQuotes] = useState({}); // { TICKER: { price, change } }
+  const [quoteDetails, setQuoteDetails] = useState({}); // { TICKER: { high, low, open, prevClose } }
+  const [candleData, setCandleData] = useState({}); // { TICKER: [candles] }
   const [liveStocks, setLiveStocks] = useState({});
   const [liveSearchResults, setLiveSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
@@ -429,11 +432,34 @@ function TradingApp({ onLogout }) {
     const universeTickers = [...TOP_50_US.map(s => s.ticker), "BTC", "ETH", "SOL"];
     const stocks = universeTickers
       .map(t => getEnrichedStockByTicker(t))
-      .filter(s => s && s.price > 0); // nur die mit Quote
+      .filter(s => s && s.price > 0);
     
-    const enriched = stocks.map(s => ({ ...s, score: calcDailyScore(s) }));
+    const enriched = stocks.map(s => {
+      // Wenn wir Quote-Details + Candles haben: Live-Score berechnen
+      const details = quoteDetails[s.ticker];
+      const candles = candleData[s.ticker];
+      let liveMetrics = null;
+      let score;
+      
+      if (details && s.price) {
+        const quoteForMetrics = {
+          price: s.price,
+          high: details.high,
+          low: details.low,
+          open: details.open,
+          prevClose: details.prevClose,
+          change: s.change
+        };
+        liveMetrics = calcAllMetrics(quoteForMetrics, candles);
+        score = calcLiveDailyScore(liveMetrics, quoteForMetrics);
+      } else {
+        // Fallback: alter Demo-Score
+        score = calcDailyScore(s);
+      }
+      
+      return { ...s, score, liveMetrics };
+    });
     
-    // Sortieren je nach Modus
     let sorted;
     if (dailySortMode === "change") {
       sorted = [...enriched].sort((a, b) => Math.abs(b.change || 0) - Math.abs(a.change || 0));
@@ -443,8 +469,8 @@ function TradingApp({ onLogout }) {
       sorted = [...enriched].sort((a, b) => Math.abs(b.change || 0) - Math.abs(a.change || 0));
     }
     
-    return sorted.slice(0, 20); // Top 20
-  }, [liveQuotes, dailySortMode, liveStocks]);
+    return sorted.slice(0, 20);
+  }, [liveQuotes, dailySortMode, liveStocks, quoteDetails, candleData]);
   
   // Long-Term bleibt erstmal aus STOCK_DB (Demo-Daten mit Fundamentals)
   const longTermRanked = useMemo(() => {
@@ -461,9 +487,7 @@ function TradingApp({ onLogout }) {
   }, [watchlist, liveQuotes, liveStocks]);
 
   // Hole Quotes fuer Universe (Top 50 US) + Crypto in Batches
-  // Batch 1 (25 Stocks) + Crypto -> ~26 Calls
-  // Batch 2 (25 Stocks) -> 25 Calls
-  // Total ~51 Calls, lassen 9 Calls/Min Buffer fuer Suche/Detail
+  // Plus Candle-Daten fuer die Top 20 (fuer Day-Trading-Metriken)
   const refreshQuotes = async (showSpinner = true) => {
     if (showSpinner) setRefreshing(true);
     setLoadedUniverseQuotes(0);
@@ -479,33 +503,75 @@ function TradingApp({ onLogout }) {
         getMultipleCryptoQuotes(cryptoTickers).catch(() => [])
       ]);
       
-      // Quotes aus Batch 1 in State schreiben (sofort sichtbar)
+      // Quotes + Details aus Batch 1 in State schreiben
       const quoteMap1 = {};
+      const detailsMap1 = {};
       [...batch1Results, ...cryptoQuotes].forEach(q => {
-        if (q.price && q.price > 0) quoteMap1[q.symbol] = { price: q.price, change: q.change || 0 };
+        if (q.price && q.price > 0) {
+          quoteMap1[q.symbol] = { price: q.price, change: q.change || 0 };
+          // Details nur fuer Stocks (Crypto-API liefert kein high/low/open)
+          if (q.high !== undefined) {
+            detailsMap1[q.symbol] = { high: q.high, low: q.low, open: q.open, prevClose: q.prevClose };
+          }
+        }
       });
       setLiveQuotes(prev => ({ ...prev, ...quoteMap1 }));
+      setQuoteDetails(prev => ({ ...prev, ...detailsMap1 }));
       setLoadedUniverseQuotes(batch1Stocks.length);
       
-      // Batch 2: Restliche 25 Stocks (sequentiell zur Batch 1 um Limits zu schonen)
+      // Batch 2: Restliche 25 Stocks
       const batch2Stocks = universeTickers.slice(25);
       const batch2Results = await getMultipleQuotes(batch2Stocks).catch(() => []);
       
       const quoteMap2 = {};
+      const detailsMap2 = {};
       batch2Results.forEach(q => {
-        if (q.price && q.price > 0) quoteMap2[q.symbol] = { price: q.price, change: q.change || 0 };
+        if (q.price && q.price > 0) {
+          quoteMap2[q.symbol] = { price: q.price, change: q.change || 0 };
+          if (q.high !== undefined) {
+            detailsMap2[q.symbol] = { high: q.high, low: q.low, open: q.open, prevClose: q.prevClose };
+          }
+        }
       });
       setLiveQuotes(prev => ({ ...prev, ...quoteMap2 }));
+      setQuoteDetails(prev => ({ ...prev, ...detailsMap2 }));
       setLoadedUniverseQuotes(50);
       
       const totalLoaded = Object.keys({ ...quoteMap1, ...quoteMap2 }).length;
       setApiStatus(totalLoaded > 0 ? "ok" : "error");
       setLastRefresh(new Date());
+      
+      // Candle-Daten im Hintergrund laden (15min-Cache, daher selten echte API-Calls)
+      // Nur fuer die Top-Mover (sparsam mit API)
+      loadCandlesForTopMovers([...batch1Results, ...batch2Results]);
     } catch (err) {
       console.error("Refresh fehlgeschlagen:", err);
       setApiStatus("error");
     } finally {
       if (showSpinner) setRefreshing(false);
+    }
+  };
+  
+  // Hilfsfunktion: Candle-Daten fuer die ~15 Aktien mit groesster Bewegung laden
+  // Beschraenkt Anzahl der API-Calls
+  const loadCandlesForTopMovers = async (allQuotes) => {
+    const topMovers = [...allQuotes]
+      .filter(q => q.symbol && q.change !== undefined)
+      .sort((a, b) => Math.abs(b.change || 0) - Math.abs(a.change || 0))
+      .slice(0, 15)
+      .map(q => q.symbol);
+    
+    if (topMovers.length === 0) return;
+    
+    try {
+      const candleResults = await getMultipleCandles(topMovers, 5);
+      const candleMap = {};
+      candleResults.forEach(r => {
+        if (r.candles) candleMap[r.symbol] = r.candles;
+      });
+      setCandleData(prev => ({ ...prev, ...candleMap }));
+    } catch (err) {
+      console.error("Candle load failed:", err);
     }
   };
 
@@ -740,7 +806,7 @@ function TradingApp({ onLogout }) {
         {tab === "lab" && selectedStock && getEnrichedStockByTicker(selectedStock) && <AnalysisLab stock={getEnrichedStockByTicker(selectedStock)} />}
 
         <div style={{ textAlign: "center", fontSize: 10, color: "#4b5563", letterSpacing: 2, padding: "32px 16px 16px" }}>
-          ◆ PHASE 2C · LIVE UNIVERSE · WATCHLIST · ANALYSIS LAB via GEMINI ◆
+          ◆ PHASE 2D · LIVE DAY-TRADING METRIKEN · WATCHLIST · ANALYSIS LAB ◆
         </div>
       </div>
     </div>
@@ -784,6 +850,9 @@ function DailyTab({ stocks, onSelect, sortMode, setSortMode, loadedCount, totalC
         {stocks.map((s, i) => {
           const inWL = watchlist.includes(s.ticker);
           const isPositive = s.change >= 0;
+          const m = s.liveMetrics;
+          const hasLive = !!m;
+          
           return (
             <div key={s.ticker}
               style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 16, display: "grid", gridTemplateColumns: "32px 130px 1fr auto", gap: 16, alignItems: "center", transition: "border-color 0.2s" }}
@@ -801,22 +870,29 @@ function DailyTab({ stocks, onSelect, sortMode, setSortMode, loadedCount, totalC
                 <div style={{ fontSize: 12, marginTop: 4, fontWeight: 600 }}>${formatPrice(s.price)}</div>
               </div>
 
-              {/* DREI METRIKEN SICHTBAR */}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, fontSize: 11 }}>
-                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
-                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>BEWEGUNG 24H</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: isPositive ? "#10b981" : "#ef4444", display: "flex", alignItems: "center", gap: 4 }}>
-                    {isPositive ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}
+              {/* LIVE METRIKEN: 4 Felder mit echten Daten */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8, fontSize: 11 }}>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>24H</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: isPositive ? "#10b981" : "#ef4444" }}>
                     {isPositive ? "+" : ""}{(s.change || 0).toFixed(2)}%
                   </div>
                 </div>
-                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
-                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>VOL vs AVG</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: "#9ca3af" }}>{s.daily?.volVsAvg || "1.0"}x</div>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>RANGE</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: hasLive && m.intradayRange > 3 ? "#f59e0b" : "#9ca3af" }}>
+                    {hasLive ? formatRange(m.intradayRange) : "—"}
+                  </div>
                 </div>
-                <div style={{ padding: "6px 10px", background: "#0a0e1a", borderRadius: 4 }}>
-                  <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>DAILY SCORE</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: getColor(s.score) }}>{s.score}</div>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>POS T-RNG</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: hasLive && (m.dayRangePosition <= 15 || m.dayRangePosition >= 85) ? "#10b981" : "#9ca3af" }}>
+                    {hasLive ? formatRangePosition(m.dayRangePosition) : "—"}
+                  </div>
+                </div>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>SCORE</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: getColor(s.score) }}>{s.score}</div>
                 </div>
               </div>
 
