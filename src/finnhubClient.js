@@ -70,6 +70,83 @@ export const getMultipleQuotes = async (symbols) => {
     .map(r => r.value);
 };
 
+// Candle-Daten holen (intraday + historical fuer Tages-Vergleich)
+// Finnhub Free: resolution=D (daily) ist verlaesslich verfuegbar
+// Intraday (z.B. 5, 15, 60 Min) erfordert in vielen Faellen Premium
+// Wir gehen den robusten Weg: 2 Tage Daily-Candle holen fuer Range-Vergleich
+export const getDailyCandles = async (symbol, days = 5) => {
+  const now = Math.floor(Date.now() / 1000);
+  const past = now - days * 24 * 60 * 60;
+  
+  try {
+    const data = await cachedFetchCandle("stock/candle", {
+      symbol,
+      resolution: "D",
+      from: past,
+      to: now
+    });
+    
+    if (data.s !== "ok" || !data.c || data.c.length === 0) {
+      return null;
+    }
+    
+    // Finnhub Candle Response: { c: [close], o: [open], h: [high], l: [low], v: [volume], t: [timestamp] }
+    const candles = [];
+    for (let i = 0; i < data.c.length; i++) {
+      candles.push({
+        close: data.c[i],
+        open: data.o[i],
+        high: data.h[i],
+        low: data.l[i],
+        volume: data.v[i],
+        timestamp: data.t[i]
+      });
+    }
+    return candles;
+  } catch (err) {
+    console.error("Candle fetch failed:", symbol, err.message);
+    return null;
+  }
+};
+
+// Eigener Cache fuer Candle-Daten mit 15-Min TTL (statt 30s)
+const candleCache = new Map();
+const CANDLE_CACHE_TTL = 15 * 60 * 1000; // 15 Minuten
+
+const cachedFetchCandle = async (endpoint, params = {}) => {
+  const cacheKey = endpoint + JSON.stringify(params);
+  const cached = candleCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CANDLE_CACHE_TTL) {
+    return cached.data;
+  }
+  
+  const queryParams = new URLSearchParams({ endpoint, ...params }).toString();
+  const response = await fetch(`/api/finnhub?${queryParams}`);
+  
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({ error: "Unbekannter Fehler" }));
+    throw new Error(errData.error || `HTTP ${response.status}`);
+  }
+  
+  const data = await response.json();
+  candleCache.set(cacheKey, { data, timestamp: Date.now() });
+  return data;
+};
+
+// Bulk Candle Fetch
+export const getMultipleCandles = async (symbols, days = 5) => {
+  const results = await Promise.allSettled(
+    symbols.map(async (symbol) => {
+      const candles = await getDailyCandles(symbol, days);
+      return { symbol, candles };
+    })
+  );
+  
+  return results
+    .filter(r => r.status === "fulfilled" && r.value.candles)
+    .map(r => r.value);
+};
+
 // Symbol-Suche: nutze die US-Symbol-Liste von Finnhub
 let symbolCache = null;
 export const searchSymbols = async (query) => {
