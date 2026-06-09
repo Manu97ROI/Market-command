@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown, Lock, LogOut } from "lucide-react";
-import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles, getFundamentals, getMultipleFundamentals, getInsiderTransactions, calcInsiderSentiment, getExecutives, matchInsiderRole } from "./finnhubClient.js";
+import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles, getDailyCandles, getFundamentals, getMultipleFundamentals, getInsiderTransactions, calcInsiderSentiment, getExecutives, matchInsiderRole } from "./finnhubClient.js";
 import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
 import { TOP_50_US, isInUniverse, getSector } from "./universe.js";
 import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } from "./watchlistStorage.js";
@@ -295,6 +295,10 @@ function TradingApp({ onLogout }) {
   const [watchlist, setWatchlist] = useState(() => loadWatchlist());
   const [dailySortMode, setDailySortMode] = useState("change"); // change | volume | score
   const [loadedUniverseQuotes, setLoadedUniverseQuotes] = useState(0); // wie viele der 50 geladen sind
+  
+  // Loading-State pro Tab/Bereich (Lazy Loading)
+  const [longTermLoading, setLongTermLoading] = useState({ inProgress: false, loaded: 0, total: 50, currentTicker: "" });
+  const [longTermLoadedOnce, setLongTermLoadedOnce] = useState(false);
 
   // Beim Watchlist-Update: hydraten was nicht in DB ist
   useEffect(() => {
@@ -463,9 +467,7 @@ function TradingApp({ onLogout }) {
       setApiStatus(totalLoaded > 0 ? "ok" : "error");
       setLastRefresh(new Date());
       
-      // Candle-Daten im Hintergrund laden (15min-Cache, daher selten echte API-Calls)
-      // Nur fuer die Top-Mover (sparsam mit API)
-      loadCandlesForTopMovers([...batch1Results, ...batch2Results]);
+      // Candles werden nur geladen wenn Detail-Tab geoeffnet wird (lazy)
     } catch (err) {
       console.error("Refresh fehlgeschlagen:", err);
       setApiStatus("error");
@@ -500,36 +502,49 @@ function TradingApp({ onLogout }) {
   // Hilfsfunktion: Fundamentaldaten fuer Top 50 in Batches laden
   // Wird beim ersten Start aufgerufen, danach 24h gecacht
   const loadFundamentals = async () => {
-    const universeTickers = TOP_50_US.map(s => s.ticker);
+    if (longTermLoading.inProgress || longTermLoadedOnce) return;
     
-    // 2 Batches a 25 fuer API-Limit-Schonung
-    const batch1 = universeTickers.slice(0, 25);
-    const batch2 = universeTickers.slice(25);
+    const universeTickers = TOP_50_US.map(s => s.ticker);
+    setLongTermLoading({ inProgress: true, loaded: 0, total: universeTickers.length, currentTicker: "" });
     
     try {
-      const results1 = await getMultipleFundamentals(batch1);
-      const fundMap = {};
-      results1.forEach(r => { if (r.fundamentals) fundMap[r.symbol] = r.fundamentals; });
-      setFundamentalsData(prev => ({ ...prev, ...fundMap }));
+      // Lade in kleinen Batches mit Progress-Updates
+      const batchSize = 10;
+      let loadedTotal = 0;
       
-      // Batch 2 nach kurzer Pause
-      await new Promise(r => setTimeout(r, 2000));
-      const results2 = await getMultipleFundamentals(batch2);
-      const fundMap2 = {};
-      results2.forEach(r => { if (r.fundamentals) fundMap2[r.symbol] = r.fundamentals; });
-      setFundamentalsData(prev => ({ ...prev, ...fundMap2 }));
+      for (let i = 0; i < universeTickers.length; i += batchSize) {
+        const batch = universeTickers.slice(i, i + batchSize);
+        setLongTermLoading(prev => ({ ...prev, currentTicker: batch[0] }));
+        
+        const results = await getMultipleFundamentals(batch);
+        const fundMap = {};
+        results.forEach(r => { if (r.fundamentals) fundMap[r.symbol] = r.fundamentals; });
+        setFundamentalsData(prev => ({ ...prev, ...fundMap }));
+        
+        loadedTotal += batch.length;
+        setLongTermLoading(prev => ({ ...prev, loaded: loadedTotal }));
+        
+        // Pause zwischen Batches um API-Limits zu schonen
+        if (i + batchSize < universeTickers.length) {
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+      
+      setLongTermLoadedOnce(true);
     } catch (err) {
       console.error("Fundamentals load fehlgeschlagen:", err);
+    } finally {
+      setLongTermLoading(prev => ({ ...prev, inProgress: false }));
     }
   };
 
-  // Beim ersten Laden: Quotes refreshen + Auto-Refresh alle 60 Sekunden + Fundamentals einmal
+  // Beim ersten Laden: NUR Quotes refreshen + Auto-Refresh alle 60 Sekunden
+  // Fundamentals/Insider/etc werden nur geladen wenn der jeweilige Tab geoeffnet wird
   useEffect(() => {
     refreshQuotes();
-    loadFundamentals(); // einmal beim Start
     autoRefreshRef.current = setInterval(() => {
-      refreshQuotes(false); // ohne Spinner, im Hintergrund
-    }, 60 * 1000); // 60 Sekunden
+      refreshQuotes(false);
+    }, 60 * 1000);
     return () => { if (autoRefreshRef.current) clearInterval(autoRefreshRef.current); };
   }, []);
 
@@ -685,6 +700,15 @@ function TradingApp({ onLogout }) {
     } catch (err) { console.error("Executives load failed:", err); }
   };
 
+  // Lade Candles fuer einen einzelnen Ticker (fuer Day-Trading-Metriken im Detail)
+  const loadSingleCandles = async (ticker) => {
+    if (candleData[ticker]) return;
+    try {
+      const candles = await getDailyCandles(ticker, 5);
+      if (candles) setCandleData(prev => ({ ...prev, [ticker]: candles }));
+    } catch (err) { console.error("Single candles load failed:", err); }
+  };
+
   const selectStock = async (ticker, hint = {}) => {
     setSelectedStock(ticker);
     setQuery("");
@@ -692,11 +716,13 @@ function TradingApp({ onLogout }) {
     setTab("detail");
     await hydrateStock(ticker, hint);
     
-    // Lade Insider + Fundamentals + Executives im Hintergrund (lazy, non-blocking)
+    // Lade alles fuer DIESE EINE Aktie (sequenziell mit kleinen Pausen)
     if (hint.assetType !== "crypto" && !isCryptoTicker(ticker)) {
-      loadInsiderTransactions(ticker);
-      loadSingleFundamentals(ticker);
+      // Executives zuerst (wird fuer Insider-Position-Matching gebraucht)
       loadExecutives(ticker);
+      loadSingleFundamentals(ticker);
+      loadInsiderTransactions(ticker);
+      loadSingleCandles(ticker);
     }
   };
 
@@ -781,7 +807,14 @@ function TradingApp({ onLogout }) {
             { id: "detail", label: "DEEP DIVE", icon: Target, disabled: !selectedStock },
             { id: "lab", label: "ANALYSIS LAB", icon: Brain, disabled: !selectedStock }
           ].map(t => (
-            <button key={t.id} onClick={() => !t.disabled && setTab(t.id)} disabled={t.disabled}
+            <button key={t.id} onClick={() => {
+              if (t.disabled) return;
+              setTab(t.id);
+              // Lazy-Load: lade Daten erst wenn Tab geoeffnet wird
+              if (t.id === "longterm" && !longTermLoadedOnce && !longTermLoading.inProgress) {
+                loadFundamentals();
+              }
+            }} disabled={t.disabled}
               style={{ background: "transparent", border: "none", borderBottom: tab === t.id ? "2px solid #10b981" : "2px solid transparent", color: tab === t.id ? "#10b981" : t.disabled ? "#374151" : "#9ca3af", padding: "12px 20px", cursor: t.disabled ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: 11, letterSpacing: 2, fontWeight: 600, display: "flex", alignItems: "center", gap: 8, marginBottom: -1 }}>
               <t.icon size={12} />{t.label}
               {t.id === "lab" && <Sparkles size={10} color="#f59e0b" />}
@@ -793,7 +826,7 @@ function TradingApp({ onLogout }) {
       <div style={{ maxWidth: 1400, margin: "0 auto", padding: "32px" }}>
         {tab === "daily" && <DailyTab stocks={dailyRanked} onSelect={selectStock} sortMode={dailySortMode} setSortMode={setDailySortMode} loadedCount={loadedUniverseQuotes} totalCount={50} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
         {tab === "watchlist" && <WatchlistTab stocks={watchlistStocks} onSelect={selectStock} onToggleWatchlist={toggleWatchlist} />}
-        {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={selectStock} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
+        {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={selectStock} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} loading={longTermLoading} />}
         {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} fundamentals={fundamentalsData[selectedStock]} liveMetrics={(() => { const det = quoteDetails[selectedStock]; const cnd = candleData[selectedStock]; const stk = getEnrichedStockByTicker(selectedStock); if (!det || !stk) return null; return calcAllMetrics({ price: stk.price, high: det.high, low: det.low, open: det.open, prevClose: det.prevClose, change: stk.change }, cnd); })()} insiderTransactions={insiderData[selectedStock]} insiderLoading={insiderLoading[selectedStock]} executives={executivesData[selectedStock]} />}
         {tab === "lab" && selectedStock && getEnrichedStockByTicker(selectedStock) && <AnalysisLab stock={getEnrichedStockByTicker(selectedStock)} />}
 
@@ -993,17 +1026,31 @@ function WatchlistTab({ stocks, onSelect, onToggleWatchlist }) {
 // ============================================
 // LONG-TERM TAB
 // ============================================
-function LongTermTab({ stocks, onSelect, watchlist = [], onToggleWatchlist }) {
+function LongTermTab({ stocks, onSelect, watchlist = [], onToggleWatchlist, loading }) {
   const loadingCount = stocks.filter(s => !s.fundamentals).length;
+  const isInitialLoading = loading?.inProgress && loadingCount === stocks.length;
   
   return (
     <div>
+      {/* Schoener Loader wenn noch nichts da ist */}
+      {isInitialLoading && (
+        <TickerTapeLoader 
+          title="◆ LOADING FUNDAMENTAL DATA"
+          subtitle="Analysiere Profitabilitaet, Wachstum, Bewertung und Financial Health fuer Top 50 US-Aktien..."
+          loaded={loading.loaded}
+          total={loading.total}
+          currentTicker={loading.currentTicker}
+          tickers={TOP_50_US.map(s => s.ticker)}
+          color="#10b981"
+        />
+      )}
+      
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
         <Anchor size={18} color="#10b981" />
         <div>
           <div style={{ fontSize: 16, fontWeight: 700 }}>Langfristige Kauf-Kandidaten</div>
           <div style={{ fontSize: 11, color: "#6b7280" }}>
-            {loadingCount > 0 ? `Lade Fundamentaldaten... (${stocks.length - loadingCount}/${stocks.length})` : "Bewertet nach Profitabilitaet, Wachstum, Bewertung, Financial Health"}
+            {loadingCount > 0 && !isInitialLoading ? `Lade Fundamentaldaten... (${stocks.length - loadingCount}/${stocks.length})` : "Bewertet nach Profitabilitaet, Wachstum, Bewertung, Financial Health"}
           </div>
         </div>
       </div>
@@ -1165,10 +1212,7 @@ function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals
               <DetailRow label="Momentum" value={formatMomentum(m.momentum)} textValue />
             </>
           ) : (
-            <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
-              <Loader2 size={16} style={{ margin: "0 auto 8px", animation: "spin 1s linear infinite" }} />
-              Lade Live-Metriken...
-            </div>
+            <MiniLoader label="DAY-TRADING DATA" color="#f59e0b" />
           )}
         </DetailPanel>
 
@@ -1189,16 +1233,212 @@ function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals
               <DetailRow label="52W Low" value={f.week52Low ? `$${formatPrice(f.week52Low)}` : "—"} textValue />
             </>
           ) : (
-            <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
-              {isCrypto ? "Fundamentaldaten nicht verfuegbar fuer Crypto" : (
-                <>
-                  <Loader2 size={16} style={{ margin: "0 auto 8px", animation: "spin 1s linear infinite" }} />
-                  Lade Fundamentaldaten...
-                </>
-              )}
-            </div>
+            isCrypto ? (
+              <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
+                Fundamentaldaten nicht verfuegbar fuer Crypto
+              </div>
+            ) : (
+              <MiniLoader label="FUNDAMENTAL DATA" color="#10b981" />
+            )
           )}
         </DetailPanel>
+      </div>
+    </div>
+  );
+}
+
+// ============================================
+// TICKER TAPE LOADER - Schoene Bloomberg-style Animation
+// ============================================
+function TickerTapeLoader({ title, subtitle, loaded, total, currentTicker, tickers = [], color = "#10b981" }) {
+  const pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
+  
+  // Tape mit den Tickers animiert durchscrollen lassen
+  const displayTickers = tickers && tickers.length > 0 ? tickers : ["LOADING"];
+  
+  // Generiere fake "Preisbewegungen" fuer Animation (rein visuell)
+  const generateFakePrice = (ticker, idx) => {
+    const seed = ticker.charCodeAt(0) + idx;
+    const change = ((seed % 200) - 100) / 100; // -1 bis +1
+    return change;
+  };
+  
+  return (
+    <div style={{ 
+      background: "linear-gradient(135deg, #111827 0%, #0f1623 100%)",
+      border: "1px solid #1f2937",
+      borderRadius: 8,
+      padding: "32px 28px",
+      marginBottom: 20,
+      overflow: "hidden",
+      position: "relative"
+    }}>
+      {/* Glow-Effekt im Hintergrund */}
+      <div style={{
+        position: "absolute",
+        top: -50,
+        left: `${pct - 10}%`,
+        width: 200,
+        height: 200,
+        background: `radial-gradient(circle, ${color}15 0%, transparent 70%)`,
+        pointerEvents: "none",
+        transition: "left 0.6s ease-out"
+      }} />
+      
+      {/* HEADER */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, position: "relative" }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+            <div style={{ 
+              width: 8, height: 8, borderRadius: "50%", background: color,
+              boxShadow: `0 0 12px ${color}`,
+              animation: "pulse-dot 1.2s ease-in-out infinite"
+            }} />
+            <div style={{ fontSize: 10, letterSpacing: 3, color: color, fontWeight: 700 }}>
+              {title}
+            </div>
+          </div>
+          <div style={{ fontSize: 13, color: "#9ca3af" }}>{subtitle}</div>
+        </div>
+        
+        {/* Counter */}
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 32, fontWeight: 700, color: color, lineHeight: 1, fontFamily: "'JetBrains Mono', monospace" }}>
+            {loaded}<span style={{ color: "#4b5563", fontSize: 22 }}>/{total}</span>
+          </div>
+          <div style={{ fontSize: 10, color: "#6b7280", letterSpacing: 2, marginTop: 4 }}>{pct}% LOADED</div>
+        </div>
+      </div>
+      
+      {/* PROGRESS BAR */}
+      <div style={{ position: "relative", marginBottom: 22 }}>
+        <div style={{ 
+          height: 6,
+          background: "#1f2937",
+          borderRadius: 3,
+          overflow: "hidden",
+          position: "relative"
+        }}>
+          <div style={{
+            height: "100%",
+            width: `${pct}%`,
+            background: `linear-gradient(90deg, ${color} 0%, ${color}aa 100%)`,
+            borderRadius: 3,
+            transition: "width 0.4s ease-out",
+            boxShadow: `0 0 10px ${color}77`,
+            position: "relative"
+          }}>
+            {/* Shimmer effect */}
+            <div style={{
+              position: "absolute",
+              top: 0,
+              right: 0,
+              width: 40,
+              height: "100%",
+              background: `linear-gradient(90deg, transparent, ${color}, transparent)`,
+              animation: "shimmer 1.5s ease-in-out infinite",
+              opacity: 0.8
+            }} />
+          </div>
+        </div>
+      </div>
+      
+      {/* CURRENT TICKER + TAPE */}
+      <div style={{ 
+        background: "#0a0e1a",
+        borderRadius: 4,
+        padding: "10px 14px",
+        border: "1px solid #1f2937",
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+        overflow: "hidden",
+        position: "relative"
+      }}>
+        <div style={{ fontSize: 9, letterSpacing: 2, color: "#6b7280", flexShrink: 0 }}>NOW:</div>
+        <div style={{ 
+          fontSize: 13,
+          fontWeight: 700,
+          color: color,
+          letterSpacing: 1,
+          flexShrink: 0,
+          minWidth: 60
+        }}>
+          {currentTicker || "..."}
+        </div>
+        
+        {/* Animated Ticker Tape */}
+        <div style={{ flex: 1, overflow: "hidden", height: 22, position: "relative", maskImage: "linear-gradient(90deg, transparent 0%, black 10%, black 90%, transparent 100%)" }}>
+          <div style={{ 
+            display: "flex",
+            gap: 24,
+            position: "absolute",
+            whiteSpace: "nowrap",
+            animation: "ticker-scroll 25s linear infinite",
+            alignItems: "center",
+            height: "100%"
+          }}>
+            {[...displayTickers, ...displayTickers, ...displayTickers].map((t, i) => {
+              const fakeChange = generateFakePrice(t, i);
+              const isPos = fakeChange >= 0;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+                  <span style={{ color: "#9ca3af", fontWeight: 600 }}>{t}</span>
+                  <span style={{ color: isPos ? "#10b981" : "#ef4444", fontSize: 10 }}>
+                    {isPos ? "▲" : "▼"} {Math.abs(fakeChange).toFixed(2)}%
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+      
+      <style>{`
+        @keyframes pulse-dot {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.5; transform: scale(0.8); }
+        }
+        @keyframes shimmer {
+          0% { transform: translateX(-50px); }
+          100% { transform: translateX(50px); }
+        }
+        @keyframes ticker-scroll {
+          0% { transform: translateX(0); }
+          100% { transform: translateX(-50%); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// ============================================
+// MINI LOADER - kompakte Version fuer einzelne Detail-Bereiche
+// ============================================
+function MiniLoader({ label, color = "#10b981" }) {
+  return (
+    <div style={{ 
+      padding: "24px 16px",
+      textAlign: "center",
+      color: "#6b7280",
+      fontSize: 11
+    }}>
+      <div style={{ 
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "8px 14px",
+        background: "#0a0e1a",
+        border: `1px solid ${color}33`,
+        borderRadius: 4,
+        marginBottom: 10
+      }}>
+        <div style={{
+          width: 6, height: 6, borderRadius: "50%", background: color,
+          boxShadow: `0 0 8px ${color}`,
+          animation: "pulse-dot 1s ease-in-out infinite"
+        }} />
+        <div style={{ fontSize: 10, letterSpacing: 1.5, color: color, fontWeight: 600 }}>{label}</div>
       </div>
     </div>
   );
@@ -1274,10 +1514,7 @@ function InsiderPanel({ transactions, loading, executives }) {
       </div>
 
       {!isLoaded ? (
-        <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
-          <Loader2 size={16} style={{ margin: "0 auto 8px", animation: "spin 1s linear infinite" }} />
-          Lade Insider-Transaktionen...
-        </div>
+        <MiniLoader label="INSIDER TRANSACTIONS" color="#f59e0b" />
       ) : txs.length === 0 ? (
         <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
           Keine Insider-Aktivitaet in den letzten 90 Tagen.
