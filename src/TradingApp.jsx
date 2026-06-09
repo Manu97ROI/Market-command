@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown, Lock, LogOut } from "lucide-react";
-import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles, getFundamentals, getMultipleFundamentals, getInsiderTransactions, calcInsiderSentiment } from "./finnhubClient.js";
+import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles, getFundamentals, getMultipleFundamentals, getInsiderTransactions, calcInsiderSentiment, getExecutives, matchInsiderRole } from "./finnhubClient.js";
 import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
 import { TOP_50_US, isInUniverse, getSector } from "./universe.js";
 import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } from "./watchlistStorage.js";
@@ -281,6 +281,7 @@ function TradingApp({ onLogout }) {
   const [fundamentalsData, setFundamentalsData] = useState({}); // { TICKER: { roe, pe, peg, ... } }
   const [insiderData, setInsiderData] = useState({}); // { TICKER: [transactions] }
   const [insiderLoading, setInsiderLoading] = useState({}); // { TICKER: bool }
+  const [executivesData, setExecutivesData] = useState({}); // { TICKER: [{name, position, ...}] }
   const [liveStocks, setLiveStocks] = useState({});
   const [liveSearchResults, setLiveSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
@@ -675,6 +676,15 @@ function TradingApp({ onLogout }) {
     } catch (err) { console.error("Single fundamentals load failed:", err); }
   };
 
+  // Lade Executives fuer einen Ticker (lazy, fuer Insider-Position-Matching)
+  const loadExecutives = async (ticker) => {
+    if (executivesData[ticker]) return;
+    try {
+      const execs = await getExecutives(ticker);
+      setExecutivesData(prev => ({ ...prev, [ticker]: execs }));
+    } catch (err) { console.error("Executives load failed:", err); }
+  };
+
   const selectStock = async (ticker, hint = {}) => {
     setSelectedStock(ticker);
     setQuery("");
@@ -682,10 +692,11 @@ function TradingApp({ onLogout }) {
     setTab("detail");
     await hydrateStock(ticker, hint);
     
-    // Lade Insider + Fundamentals im Hintergrund (lazy, non-blocking)
+    // Lade Insider + Fundamentals + Executives im Hintergrund (lazy, non-blocking)
     if (hint.assetType !== "crypto" && !isCryptoTicker(ticker)) {
       loadInsiderTransactions(ticker);
       loadSingleFundamentals(ticker);
+      loadExecutives(ticker);
     }
   };
 
@@ -783,7 +794,7 @@ function TradingApp({ onLogout }) {
         {tab === "daily" && <DailyTab stocks={dailyRanked} onSelect={selectStock} sortMode={dailySortMode} setSortMode={setDailySortMode} loadedCount={loadedUniverseQuotes} totalCount={50} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
         {tab === "watchlist" && <WatchlistTab stocks={watchlistStocks} onSelect={selectStock} onToggleWatchlist={toggleWatchlist} />}
         {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={selectStock} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
-        {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} fundamentals={fundamentalsData[selectedStock]} liveMetrics={(() => { const det = quoteDetails[selectedStock]; const cnd = candleData[selectedStock]; const stk = getEnrichedStockByTicker(selectedStock); if (!det || !stk) return null; return calcAllMetrics({ price: stk.price, high: det.high, low: det.low, open: det.open, prevClose: det.prevClose, change: stk.change }, cnd); })()} insiderTransactions={insiderData[selectedStock]} insiderLoading={insiderLoading[selectedStock]} />}
+        {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} fundamentals={fundamentalsData[selectedStock]} liveMetrics={(() => { const det = quoteDetails[selectedStock]; const cnd = candleData[selectedStock]; const stk = getEnrichedStockByTicker(selectedStock); if (!det || !stk) return null; return calcAllMetrics({ price: stk.price, high: det.high, low: det.low, open: det.open, prevClose: det.prevClose, change: stk.change }, cnd); })()} insiderTransactions={insiderData[selectedStock]} insiderLoading={insiderLoading[selectedStock]} executives={executivesData[selectedStock]} />}
         {tab === "lab" && selectedStock && getEnrichedStockByTicker(selectedStock) && <AnalysisLab stock={getEnrichedStockByTicker(selectedStock)} />}
 
         <div style={{ textAlign: "center", fontSize: 10, color: "#4b5563", letterSpacing: 2, padding: "32px 16px 16px" }}>
@@ -1078,7 +1089,7 @@ function LongTermTab({ stocks, onSelect, watchlist = [], onToggleWatchlist }) {
 // ============================================
 // DETAIL TAB - alles live
 // ============================================
-function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals, liveMetrics, insiderTransactions, insiderLoading }) {
+function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals, liveMetrics, insiderTransactions, insiderLoading, executives }) {
   // Long-Term Score live
   const longScore = calcLongTermScoreLive(fundamentals) ?? 50;
   // Daily Score: nutze Live wenn vorhanden, sonst fallback
@@ -1139,7 +1150,7 @@ function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals
 
       {/* INSIDER ACTIVITY PANEL */}
       {!isCrypto && (
-        <InsiderPanel transactions={insiderTransactions} loading={insiderLoading} />
+        <InsiderPanel transactions={insiderTransactions} loading={insiderLoading} executives={executives} />
       )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
@@ -1210,9 +1221,18 @@ function BreakdownCard({ label, weight, score }) {
 // ============================================
 // INSIDER PANEL - Live SEC Form 4 Filings
 // ============================================
-function InsiderPanel({ transactions, loading }) {
+function InsiderPanel({ transactions, loading, executives }) {
   const isLoaded = transactions !== undefined && !loading;
   const txs = transactions || [];
+  const execs = executives || [];
+  
+  // Reicher die Transaktionen mit der Position an wenn Match
+  const enrichedTxs = useMemo(() => {
+    return txs.map(t => ({
+      ...t,
+      matchedRole: matchInsiderRole(t.name, execs)
+    }));
+  }, [txs, execs]);
   
   // Sentiment berechnen
   const sentiment = useMemo(() => {
@@ -1301,7 +1321,7 @@ function InsiderPanel({ transactions, loading }) {
               <div style={{ textAlign: "right" }}>WERT</div>
               <div style={{ textAlign: "right" }}>DATUM</div>
             </div>
-            {txs.slice(0, 12).map((t, i) => {
+            {enrichedTxs.slice(0, 12).map((t, i) => {
               const actionColor = t.action === "bought" ? "#10b981" : t.action === "sold" ? "#ef4444" : "#9ca3af";
               const actionLabel = {
                 bought: "KAUF",
@@ -1309,13 +1329,18 @@ function InsiderPanel({ transactions, loading }) {
                 acquired: "OPTIONS",
                 other: "OTHER"
               }[t.action] || t.action.toUpperCase();
+              const positionDisplay = t.matchedRole || t.role || null;
               return (
                 <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 100px 100px 110px 90px", gap: 10, padding: "10px 10px", fontSize: 11, borderBottom: "1px dashed #1f2937", alignItems: "center" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <User size={11} color="#f59e0b" />
                     <div>
                       <div style={{ fontWeight: 600, fontSize: 11 }}>{t.name}</div>
-                      {t.role && <div style={{ fontSize: 9, color: "#6b7280", marginTop: 1 }}>{t.role}</div>}
+                      {positionDisplay && (
+                        <div style={{ fontSize: 9, color: "#10b981", marginTop: 2, letterSpacing: 0.5, fontWeight: 600 }}>
+                          {positionDisplay}
+                        </div>
+                      )}
                     </div>
                   </div>
                   <div>
