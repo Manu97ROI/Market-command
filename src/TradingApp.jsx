@@ -7,6 +7,9 @@ import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } fro
 import { getAuthToken, login, clearAuthToken } from "./authStorage.js";
 import { calcAllMetrics, calcLiveDailyScore, formatRange, formatRangePosition, formatRangeMultiplier, formatMomentum } from "./dayTradingMetrics.js";
 import { calcLongTermScoreLive, getLongTermBreakdown, formatPct, formatRatio } from "./longTermScoring.js";
+import { hydrateFundamentals, hydrateInsiderTransactions, hydrateExecutives, hydrateCandles } from "./hydration.js";
+import { getTaskQueue } from "./taskQueue.js";
+import { getCacheStats } from "./storage.js";
 
 // ============================================
 // ============================================
@@ -389,19 +392,26 @@ function TradingApp({ onLogout }) {
   // Long-Term bleibt erstmal aus STOCK_DB (Demo-Daten mit Fundamentals)
   const longTermRanked = useMemo(() => {
     const universeTickers = TOP_50_US.map(s => s.ticker);
+    // Optimistic UI: zeige ALLE 50, auch ohne Quote (mit Skeleton/Lade-Anzeige)
     const stocks = universeTickers
       .map(t => getEnrichedStockByTicker(t))
-      .filter(s => s && s.price > 0);
+      .filter(Boolean);
     
     const enriched = stocks.map(s => {
       const fundamentals = fundamentalsData[s.ticker];
       const liveScore = calcLongTermScoreLive(fundamentals);
-      const score = liveScore != null ? liveScore : 50; // Fallback wenn noch nicht geladen
+      const score = liveScore != null ? liveScore : null; // null = noch keine Daten
       const breakdown = getLongTermBreakdown(fundamentals);
       return { ...s, score, fundamentals, breakdown };
     });
     
-    return enriched.sort((a, b) => b.score - a.score);
+    // Sortierung: bewertete oben (nach Score), unbewertete unten (in Universum-Reihenfolge)
+    return enriched.sort((a, b) => {
+      if (a.score == null && b.score == null) return 0;
+      if (a.score == null) return 1;
+      if (b.score == null) return -1;
+      return b.score - a.score;
+    });
   }, [liveQuotes, liveStocks, fundamentalsData]);
 
   // Watchlist Stocks (mit Live-Quotes wenn vorhanden)
@@ -499,54 +509,97 @@ function TradingApp({ onLogout }) {
     }
   };
 
-  // Hilfsfunktion: Fundamentaldaten fuer Top 50 in Batches laden
-  // Wird beim ersten Start aufgerufen, danach 24h gecacht
+  // Hilfsfunktion: Fundamentaldaten fuer Top 50 mit Multi-Source Hydration
+  // Foreground: ersten 10 werden mit Prio geladen (sichtbar)
+  // Background: Rest wird langsam im Hintergrund nachgeladen
   const loadFundamentals = async () => {
     if (longTermLoading.inProgress || longTermLoadedOnce) return;
     
     const universeTickers = TOP_50_US.map(s => s.ticker);
     setLongTermLoading({ inProgress: true, loaded: 0, total: universeTickers.length, currentTicker: "" });
     
-    try {
-      // Lade in kleinen Batches mit Progress-Updates
-      const batchSize = 10;
-      let loadedTotal = 0;
-      
-      for (let i = 0; i < universeTickers.length; i += batchSize) {
-        const batch = universeTickers.slice(i, i + batchSize);
-        setLongTermLoading(prev => ({ ...prev, currentTicker: batch[0] }));
-        
-        const results = await getMultipleFundamentals(batch);
-        const fundMap = {};
-        results.forEach(r => { if (r.fundamentals) fundMap[r.symbol] = r.fundamentals; });
-        setFundamentalsData(prev => ({ ...prev, ...fundMap }));
-        
-        loadedTotal += batch.length;
-        setLongTermLoading(prev => ({ ...prev, loaded: loadedTotal }));
-        
-        // Pause zwischen Batches um API-Limits zu schonen
-        if (i + batchSize < universeTickers.length) {
-          await new Promise(r => setTimeout(r, 1500));
+    let loadedCount = 0;
+    
+    // FOREGROUND: lade die ersten 10 mit Prio (parallel, sichtbar)
+    const foregroundBatch = universeTickers.slice(0, 10);
+    await Promise.all(foregroundBatch.map(async (ticker) => {
+      try {
+        setLongTermLoading(prev => ({ ...prev, currentTicker: ticker }));
+        const { data } = await hydrateFundamentals(ticker);
+        if (data) {
+          setFundamentalsData(prev => ({ ...prev, [ticker]: data }));
         }
-      }
-      
-      setLongTermLoadedOnce(true);
-    } catch (err) {
-      console.error("Fundamentals load fehlgeschlagen:", err);
-    } finally {
+      } catch (err) { console.warn("Foreground hydrate failed:", ticker, err.message); }
+      loadedCount++;
+      setLongTermLoading(prev => ({ ...prev, loaded: loadedCount }));
+    }));
+    
+    // BACKGROUND: Rest wird in TaskQueue eingereiht (rate-limited)
+    const remaining = universeTickers.slice(10);
+    const queue = getTaskQueue({ minDelayMs: 1200 });
+    
+    remaining.forEach(ticker => {
+      queue.enqueueBackground(`fundamentals:${ticker}`, async () => {
+        try {
+          const { data } = await hydrateFundamentals(ticker);
+          if (data) {
+            setFundamentalsData(prev => ({ ...prev, [ticker]: data }));
+          }
+        } catch (err) { console.warn("Background hydrate failed:", ticker, err.message); }
+        loadedCount++;
+        setLongTermLoading(prev => ({ ...prev, loaded: loadedCount, currentTicker: ticker }));
+        
+        if (loadedCount >= universeTickers.length) {
+          setLongTermLoading(prev => ({ ...prev, inProgress: false }));
+          setLongTermLoadedOnce(true);
+        }
+      });
+    });
+    
+    // Wenn keine Background-Tasks: Loader sofort aus
+    if (remaining.length === 0) {
       setLongTermLoading(prev => ({ ...prev, inProgress: false }));
+      setLongTermLoadedOnce(true);
     }
   };
 
   // Beim ersten Laden: NUR Quotes refreshen + Auto-Refresh alle 60 Sekunden
-  // Fundamentals/Insider/etc werden nur geladen wenn der jeweilige Tab geoeffnet wird
+  // Nach 3 Sekunden: Background Pre-Load fuer Fundamentaldaten starten (low-prio)
   useEffect(() => {
     refreshQuotes();
     autoRefreshRef.current = setInterval(() => {
       refreshQuotes(false);
     }, 60 * 1000);
-    return () => { if (autoRefreshRef.current) clearInterval(autoRefreshRef.current); };
+    
+    // Pre-load Fundamentaldaten silently im Hintergrund nach 3 Sek
+    // So sind sie schon (teilweise) da wenn User auf Long-Term klickt
+    const preLoadTimer = setTimeout(() => {
+      preloadFundamentalsInBackground();
+    }, 3000);
+    
+    return () => { 
+      if (autoRefreshRef.current) clearInterval(autoRefreshRef.current); 
+      clearTimeout(preLoadTimer);
+    };
   }, []);
+  
+  // Silent Background Pre-Loader (laeuft beim App-Start)
+  // Setzt sichtbaren Loader NICHT, fuellt nur stillen Cache
+  const preloadFundamentalsInBackground = () => {
+    const universeTickers = TOP_50_US.map(s => s.ticker);
+    const queue = getTaskQueue({ minDelayMs: 2000 }); // 2 Sek zwischen Calls = sehr sanft
+    
+    universeTickers.forEach(ticker => {
+      queue.enqueueBackground(`preload-fundamentals:${ticker}`, async () => {
+        try {
+          const { data } = await hydrateFundamentals(ticker);
+          if (data) {
+            setFundamentalsData(prev => ({ ...prev, [ticker]: data }));
+          }
+        } catch (err) { /* silent */ }
+      }, { silent: true });
+    });
+  };
 
   // Watchlist Toggle (hinzufuegen/entfernen)
   const toggleWatchlist = (ticker) => {
@@ -663,17 +716,15 @@ function TradingApp({ onLogout }) {
     }
   };
 
-  // Wenn neue Aktie/Coin ausgewaehlt -> Detail oeffnen + ggf. hydraten
-  // Lade Insider Transactions fuer einen Ticker (lazy, nur wenn benoetigt)
+  // Single-Loader nutzen jetzt das Hydration-System mit IndexedDB-Cache
   const loadInsiderTransactions = async (ticker) => {
-    // Schon im Cache?
     if (insiderData[ticker] !== undefined) return;
     if (insiderLoading[ticker]) return;
     
     setInsiderLoading(prev => ({ ...prev, [ticker]: true }));
     try {
-      const transactions = await getInsiderTransactions(ticker, 90);
-      setInsiderData(prev => ({ ...prev, [ticker]: transactions }));
+      const { data } = await hydrateInsiderTransactions(ticker, getInsiderTransactions);
+      setInsiderData(prev => ({ ...prev, [ticker]: data }));
     } catch (err) {
       console.error("Insider load failed:", err);
       setInsiderData(prev => ({ ...prev, [ticker]: [] }));
@@ -682,21 +733,19 @@ function TradingApp({ onLogout }) {
     }
   };
   
-  // Lade Fundamentals fuer einen einzelnen Ticker on-demand
   const loadSingleFundamentals = async (ticker) => {
     if (fundamentalsData[ticker]) return;
     try {
-      const f = await getFundamentals(ticker);
-      if (f) setFundamentalsData(prev => ({ ...prev, [ticker]: f }));
+      const { data } = await hydrateFundamentals(ticker);
+      if (data) setFundamentalsData(prev => ({ ...prev, [ticker]: data }));
     } catch (err) { console.error("Single fundamentals load failed:", err); }
   };
 
-  // Lade Executives fuer einen Ticker (lazy, fuer Insider-Position-Matching)
   const loadExecutives = async (ticker) => {
     if (executivesData[ticker]) return;
     try {
-      const execs = await getExecutives(ticker);
-      setExecutivesData(prev => ({ ...prev, [ticker]: execs }));
+      const { data } = await hydrateExecutives(ticker, getExecutives);
+      setExecutivesData(prev => ({ ...prev, [ticker]: data }));
     } catch (err) { console.error("Executives load failed:", err); }
   };
 
@@ -704,8 +753,8 @@ function TradingApp({ onLogout }) {
   const loadSingleCandles = async (ticker) => {
     if (candleData[ticker]) return;
     try {
-      const candles = await getDailyCandles(ticker, 5);
-      if (candles) setCandleData(prev => ({ ...prev, [ticker]: candles }));
+      const { data } = await hydrateCandles(ticker, getDailyCandles);
+      if (data) setCandleData(prev => ({ ...prev, [ticker]: data }));
     } catch (err) { console.error("Single candles load failed:", err); }
   };
 
@@ -716,13 +765,15 @@ function TradingApp({ onLogout }) {
     setTab("detail");
     await hydrateStock(ticker, hint);
     
-    // Lade alles fuer DIESE EINE Aktie (sequenziell mit kleinen Pausen)
+    // Foreground-Promotion: alle Loaders fuer DIESE Aktie sofort, ohne auf Background-Queue zu warten
     if (hint.assetType !== "crypto" && !isCryptoTicker(ticker)) {
-      // Executives zuerst (wird fuer Insider-Position-Matching gebraucht)
-      loadExecutives(ticker);
-      loadSingleFundamentals(ticker);
-      loadInsiderTransactions(ticker);
-      loadSingleCandles(ticker);
+      const queue = getTaskQueue();
+      
+      // Promote: zieht den Task aus Background-Queue raus und fuehrt sofort aus
+      queue.promote(`fundamentals:${ticker}`, () => loadSingleFundamentals(ticker));
+      queue.promote(`insider:${ticker}`, () => loadInsiderTransactions(ticker));
+      queue.promote(`executives:${ticker}`, () => loadExecutives(ticker));
+      queue.promote(`candles:${ticker}`, () => loadSingleCandles(ticker));
     }
   };
 
@@ -1027,22 +1078,56 @@ function WatchlistTab({ stocks, onSelect, onToggleWatchlist }) {
 // LONG-TERM TAB
 // ============================================
 function LongTermTab({ stocks, onSelect, watchlist = [], onToggleWatchlist, loading }) {
-  const loadingCount = stocks.filter(s => !s.fundamentals).length;
-  const isInitialLoading = loading?.inProgress && loadingCount === stocks.length;
+  const loadedCount = stocks.filter(s => s.fundamentals).length;
+  const total = stocks.length;
+  const isLoading = loading?.inProgress && loadedCount < total;
+  const pct = total > 0 ? Math.round((loadedCount / total) * 100) : 0;
   
   return (
     <div>
-      {/* Schoener Loader wenn noch nichts da ist */}
-      {isInitialLoading && (
-        <TickerTapeLoader 
-          title="◆ LOADING FUNDAMENTAL DATA"
-          subtitle="Analysiere Profitabilitaet, Wachstum, Bewertung und Financial Health fuer Top 50 US-Aktien..."
-          loaded={loading.loaded}
-          total={loading.total}
-          currentTicker={loading.currentTicker}
-          tickers={TOP_50_US.map(s => s.ticker)}
-          color="#10b981"
-        />
+      {/* Kompakter Status-Banner statt grosser Loader - Daten erscheinen live unten */}
+      {isLoading && (
+        <div style={{ 
+          background: "linear-gradient(135deg, #111827 0%, #0f1623 100%)",
+          border: "1px solid #1f2937",
+          borderRadius: 6,
+          padding: "12px 18px",
+          marginBottom: 16,
+          display: "flex",
+          alignItems: "center",
+          gap: 14,
+          position: "relative",
+          overflow: "hidden"
+        }}>
+          <div style={{
+            width: 8, height: 8, borderRadius: "50%", background: "#10b981",
+            boxShadow: "0 0 12px #10b981",
+            animation: "pulse-dot 1.2s ease-in-out infinite",
+            flexShrink: 0
+          }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 10, letterSpacing: 2, color: "#10b981", fontWeight: 700, marginBottom: 4 }}>
+              ◆ HYDRATING FUNDAMENTAL DATA
+            </div>
+            <div style={{ fontSize: 11, color: "#9ca3af" }}>
+              {loadedCount}/{total} geladen · Multi-Source: Finnhub + Yahoo Fallback · Daten erscheinen live
+            </div>
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: "#10b981", fontFamily: "'JetBrains Mono', monospace", minWidth: 60, textAlign: "right" }}>
+            {pct}%
+          </div>
+          {/* Progress Bar am Boden */}
+          <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 2, background: "#1f2937" }}>
+            <div style={{
+              height: "100%",
+              width: `${pct}%`,
+              background: "linear-gradient(90deg, #10b981, #10b981aa)",
+              transition: "width 0.4s ease-out",
+              boxShadow: "0 0 8px #10b98177"
+            }} />
+          </div>
+          <style>{`@keyframes pulse-dot { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(0.8); } }`}</style>
+        </div>
       )}
       
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
@@ -1050,7 +1135,7 @@ function LongTermTab({ stocks, onSelect, watchlist = [], onToggleWatchlist, load
         <div>
           <div style={{ fontSize: 16, fontWeight: 700 }}>Langfristige Kauf-Kandidaten</div>
           <div style={{ fontSize: 11, color: "#6b7280" }}>
-            {loadingCount > 0 && !isInitialLoading ? `Lade Fundamentaldaten... (${stocks.length - loadingCount}/${stocks.length})` : "Bewertet nach Profitabilitaet, Wachstum, Bewertung, Financial Health"}
+            Bewertet nach Profitabilitaet, Wachstum, Bewertung, Financial Health
           </div>
         </div>
       </div>
