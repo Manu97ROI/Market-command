@@ -1547,11 +1547,15 @@ function BreakdownCard({ label, weight, score }) {
 // INSIDER PANEL - Live SEC Form 4 Filings
 // ============================================
 function InsiderPanel({ transactions, loading, executives }) {
+  const [showAllSells, setShowAllSells] = useState(false);
+  const [showAllBuys, setShowAllBuys] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState({}); // { "name:date": true }
+  
   const isLoaded = transactions !== undefined && !loading;
   const txs = transactions || [];
   const execs = executives || [];
   
-  // Reicher die Transaktionen mit der Position an wenn Match
+  // Reichere Transaktionen mit Position an
   const enrichedTxs = useMemo(() => {
     return txs.map(t => ({
       ...t,
@@ -1559,36 +1563,105 @@ function InsiderPanel({ transactions, loading, executives }) {
     }));
   }, [txs, execs]);
   
-  // Sentiment berechnen
+  // Gruppiere Transaktionen pro Insider + Tag
+  const grouped = useMemo(() => {
+    const buyGroups = {};
+    const sellGroups = {};
+    
+    enrichedTxs.forEach(t => {
+      const key = `${t.name}::${t.date}`;
+      const target = (t.action === "bought" || t.action === "acquired") ? buyGroups : sellGroups;
+      // Verkaeufe = nur action "sold". Andere actions als Kauf werten.
+      const isBuy = t.action === "bought" || t.action === "acquired";
+      const groupTarget = isBuy ? buyGroups : sellGroups;
+      
+      if (!groupTarget[key]) {
+        groupTarget[key] = {
+          name: t.name,
+          date: t.date,
+          role: t.matchedRole,
+          trades: [],
+          totalShares: 0,
+          totalValue: 0,
+          avgPrice: 0,
+          hasRealBuy: false // Code P = echter Kauf
+        };
+      }
+      groupTarget[key].trades.push(t);
+      groupTarget[key].totalShares += t.shares || 0;
+      groupTarget[key].totalValue += t.value || 0;
+      if (t.code === "P") groupTarget[key].hasRealBuy = true;
+    });
+    
+    // Average Price berechnen + zu Arrays
+    const toArray = (obj) => Object.entries(obj).map(([key, g]) => ({
+      ...g,
+      key,
+      avgPrice: g.totalShares > 0 ? g.totalValue / g.totalShares : 0
+    }));
+    
+    return {
+      buys: toArray(buyGroups).sort((a, b) => new Date(b.date) - new Date(a.date)),
+      sells: toArray(sellGroups).sort((a, b) => new Date(b.date) - new Date(a.date))
+    };
+  }, [enrichedTxs]);
+  
+  // Sentiment basiert nur auf ECHTEN Kaeufen (Code P) vs Verkaeufen
   const sentiment = useMemo(() => {
     if (!txs || txs.length === 0) return null;
-    return calcInsiderSentiment(txs);
-  }, [txs]);
-
+    const realBuys = enrichedTxs.filter(t => t.action === "bought" && t.code === "P");
+    const sells = enrichedTxs.filter(t => t.action === "sold");
+    
+    const totalBuy = realBuys.reduce((s, t) => s + (t.value || 0), 0);
+    const totalSell = sells.reduce((s, t) => s + (t.value || 0), 0);
+    const uniqueBuyers = new Set(realBuys.map(t => t.name)).size;
+    
+    let score = 50;
+    const total = totalBuy + totalSell;
+    if (total > 0) score = Math.round((totalBuy / total) * 100);
+    if (uniqueBuyers >= 3) score = Math.min(100, score + 15);
+    
+    let signal = "neutral";
+    if (uniqueBuyers === 0 && sells.length > 0) signal = "bearish";
+    else if (score >= 70 && totalBuy > 100000) signal = "bullish";
+    else if (score >= 85) signal = "very_bullish";
+    else if (score <= 30 && totalSell > 1000000) signal = "bearish";
+    
+    return { score, totalBuy, totalSell, buyCount: realBuys.length, sellCount: sells.length, uniqueBuyers, signal };
+  }, [enrichedTxs]);
+  
   const formatValue = (v) => {
     if (v >= 1000000) return `$${(v/1000000).toFixed(2)}M`;
     if (v >= 1000) return `$${(v/1000).toFixed(0)}K`;
-    return `$${v.toFixed(0)}`;
+    return `$${(v || 0).toFixed(0)}`;
   };
   
   const formatShares = (s) => {
     if (s >= 1000000) return `${(s/1000000).toFixed(2)}M`;
     if (s >= 1000) return `${(s/1000).toFixed(0)}K`;
-    return s.toString();
+    return (s || 0).toString();
   };
 
-  const sentimentColor = sentiment 
-    ? (sentiment.score >= 70 ? "#10b981" : sentiment.score <= 30 ? "#ef4444" : "#9ca3af")
-    : "#9ca3af";
-  
-  const signalText = sentiment ? {
+  const toggleGroup = (key) => {
+    setExpandedGroups(prev => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const signalColors = {
+    very_bullish: "#10b981",
+    bullish: "#10b981",
+    neutral: "#9ca3af",
+    bearish: "#ef4444",
+    very_bearish: "#ef4444",
+    no_data: "#9ca3af"
+  };
+  const signalText = {
     very_bullish: "STARK BULLISCH",
     bullish: "BULLISCH",
     neutral: "NEUTRAL",
     bearish: "BAERISCH",
     very_bearish: "STARK BAERISCH",
     no_data: "KEINE DATEN"
-  }[sentiment.signal] : "—";
+  };
 
   return (
     <div style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 20, marginBottom: 20 }}>
@@ -1600,7 +1673,7 @@ function InsiderPanel({ transactions, loading, executives }) {
 
       {!isLoaded ? (
         <MiniLoader label="INSIDER TRANSACTIONS" color="#f59e0b" />
-      ) : txs.length === 0 ? (
+      ) : enrichedTxs.length === 0 ? (
         <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
           Keine Insider-Aktivitaet in den letzten 90 Tagen.
         </div>
@@ -1608,87 +1681,190 @@ function InsiderPanel({ transactions, loading, executives }) {
         <>
           {/* SENTIMENT SUMMARY */}
           {sentiment && (
-            <div style={{ display: "grid", gridTemplateColumns: "auto 1fr 1fr 1fr", gap: 16, marginBottom: 18, padding: 14, background: "#0a0e1a", borderRadius: 4, border: "1px solid #1f2937", alignItems: "center" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "auto 1fr 1fr 1fr", gap: 16, marginBottom: 20, padding: 14, background: "#0a0e1a", borderRadius: 4, border: "1px solid #1f2937", alignItems: "center" }}>
               <div>
                 <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>SIGNAL</div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: sentimentColor }}>{signalText}</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: signalColors[sentiment.signal] }}>{signalText[sentiment.signal]}</div>
                 <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>Score: {sentiment.score}/100</div>
               </div>
               <div>
-                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>KAUF-VOLUMEN</div>
+                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>ECHTE KAEUFE (P)</div>
                 <div style={{ fontSize: 16, fontWeight: 700, color: "#10b981" }}>{formatValue(sentiment.totalBuy)}</div>
-                <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>{sentiment.buyCount} Trades</div>
+                <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>{sentiment.buyCount} Trades · {sentiment.uniqueBuyers} unique</div>
               </div>
               <div>
-                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>VERKAUF-VOLUMEN</div>
+                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>VERKAUFS-VOL</div>
                 <div style={{ fontSize: 16, fontWeight: 700, color: "#ef4444" }}>{formatValue(sentiment.totalSell)}</div>
                 <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>{sentiment.sellCount} Trades</div>
               </div>
               <div>
-                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>UNIQUE KAEUFER</div>
-                <div style={{ fontSize: 16, fontWeight: 700, color: sentiment.uniqueBuyers >= 3 ? "#10b981" : "#9ca3af" }}>{sentiment.uniqueBuyers || 0}</div>
+                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>CLUSTER BUYING</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: sentiment.uniqueBuyers >= 3 ? "#10b981" : "#9ca3af" }}>
+                  {sentiment.uniqueBuyers >= 3 ? "JA" : "NEIN"}
+                </div>
                 <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>
-                  {sentiment.uniqueBuyers >= 3 ? "Cluster Buying!" : "—"}
+                  {sentiment.uniqueBuyers >= 3 ? "starkes Signal!" : `${sentiment.uniqueBuyers} Käufer`}
                 </div>
               </div>
             </div>
           )}
 
-          {/* TRANSACTION TABLE */}
-          <div>
-            <div style={{ display: "grid", gridTemplateColumns: "2fr 100px 100px 110px 90px", gap: 10, padding: "8px 10px", fontSize: 9, letterSpacing: 1.5, color: "#6b7280", borderBottom: "1px solid #1f2937" }}>
-              <div>INSIDER</div>
-              <div>AKTION</div>
-              <div style={{ textAlign: "right" }}>SHARES @ PREIS</div>
-              <div style={{ textAlign: "right" }}>WERT</div>
-              <div style={{ textAlign: "right" }}>DATUM</div>
-            </div>
-            {enrichedTxs.slice(0, 12).map((t, i) => {
-              const actionColor = t.action === "bought" ? "#10b981" : t.action === "sold" ? "#ef4444" : "#9ca3af";
-              const actionLabel = {
-                bought: "KAUF",
-                sold: "VERKAUF",
-                acquired: "OPTIONS",
-                other: "OTHER"
-              }[t.action] || t.action.toUpperCase();
-              const positionDisplay = t.matchedRole || t.role || null;
-              return (
-                <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 100px 100px 110px 90px", gap: 10, padding: "10px 10px", fontSize: 11, borderBottom: "1px dashed #1f2937", alignItems: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <User size={11} color="#f59e0b" />
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: 11 }}>{t.name}</div>
-                      {positionDisplay && (
-                        <div style={{ fontSize: 9, color: "#10b981", marginTop: 2, letterSpacing: 0.5, fontWeight: 600 }}>
-                          {positionDisplay}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  <div>
-                    <span style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "2px 7px", borderRadius: 3, fontSize: 9, fontWeight: 700, letterSpacing: 1, background: `${actionColor}15`, color: actionColor }}>
-                      {t.action === "bought" && <ArrowUpRight size={9} />}
-                      {t.action === "sold" && <ArrowDownRight size={9} />}
-                      {actionLabel}
-                    </span>
-                  </div>
-                  <div style={{ textAlign: "right", fontSize: 10 }}>
-                    <div>{formatShares(t.shares)}</div>
-                    <div style={{ fontSize: 9, color: "#6b7280" }}>@ ${formatPrice(t.price)}</div>
-                  </div>
-                  <div style={{ textAlign: "right", fontWeight: 700, color: actionColor, fontSize: 12 }}>{formatValue(t.value)}</div>
-                  <div style={{ textAlign: "right", fontSize: 9, color: "#9ca3af" }}>{t.date}</div>
+          {/* ZWEI-SPALTEN-LAYOUT: KAEUFE | VERKAEUFE */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+            
+            {/* KAEUFE */}
+            <div style={{ background: "rgba(16,185,129,0.04)", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 6, padding: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, paddingBottom: 10, borderBottom: "1px dashed rgba(16,185,129,0.2)" }}>
+                <ArrowUpRight size={12} color="#10b981" />
+                <div style={{ fontSize: 10, letterSpacing: 2, fontWeight: 700, color: "#10b981" }}>KAEUFE & ACQUISITIONS</div>
+                <div style={{ marginLeft: "auto", fontSize: 10, color: "#6b7280" }}>{grouped.buys.length} Gruppen</div>
+              </div>
+              {grouped.buys.length === 0 ? (
+                <div style={{ padding: "20px 0", textAlign: "center", color: "#6b7280", fontSize: 11 }}>
+                  Keine Kaeufe in den letzten 90 Tagen.
                 </div>
-              );
-            })}
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {(showAllBuys ? grouped.buys : grouped.buys.slice(0, 8)).map(g => (
+                    <InsiderGroup 
+                      key={g.key} 
+                      group={g} 
+                      type="buy" 
+                      expanded={!!expandedGroups[g.key]}
+                      onToggle={() => toggleGroup(g.key)}
+                      formatValue={formatValue}
+                      formatShares={formatShares}
+                    />
+                  ))}
+                  {grouped.buys.length > 8 && (
+                    <button onClick={() => setShowAllBuys(!showAllBuys)}
+                      style={{ background: "transparent", border: "1px dashed rgba(16,185,129,0.3)", color: "#10b981", padding: "8px 12px", borderRadius: 4, fontFamily: "inherit", fontSize: 10, letterSpacing: 1.5, fontWeight: 600, cursor: "pointer", marginTop: 4 }}>
+                      {showAllBuys ? "WENIGER ZEIGEN" : `+ ${grouped.buys.length - 8} WEITERE`}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* VERKAEUFE */}
+            <div style={{ background: "rgba(239,68,68,0.04)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 6, padding: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, paddingBottom: 10, borderBottom: "1px dashed rgba(239,68,68,0.2)" }}>
+                <ArrowDownRight size={12} color="#ef4444" />
+                <div style={{ fontSize: 10, letterSpacing: 2, fontWeight: 700, color: "#ef4444" }}>VERKAEUFE</div>
+                <div style={{ marginLeft: "auto", fontSize: 10, color: "#6b7280" }}>{grouped.sells.length} Gruppen</div>
+              </div>
+              {grouped.sells.length === 0 ? (
+                <div style={{ padding: "20px 0", textAlign: "center", color: "#6b7280", fontSize: 11 }}>
+                  Keine Verkaeufe.
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {(showAllSells ? grouped.sells : grouped.sells.slice(0, 5)).map(g => (
+                    <InsiderGroup 
+                      key={g.key} 
+                      group={g} 
+                      type="sell" 
+                      expanded={!!expandedGroups[g.key]}
+                      onToggle={() => toggleGroup(g.key)}
+                      formatValue={formatValue}
+                      formatShares={formatShares}
+                    />
+                  ))}
+                  {grouped.sells.length > 5 && (
+                    <button onClick={() => setShowAllSells(!showAllSells)}
+                      style={{ background: "transparent", border: "1px dashed rgba(239,68,68,0.3)", color: "#ef4444", padding: "8px 12px", borderRadius: 4, fontFamily: "inherit", fontSize: 10, letterSpacing: 1.5, fontWeight: 600, cursor: "pointer", marginTop: 4 }}>
+                      {showAllSells ? "WENIGER ZEIGEN" : `+ ${grouped.sells.length - 5} WEITERE`}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
-          
-          {txs.length > 12 && (
-            <div style={{ textAlign: "center", padding: "10px 0", fontSize: 10, color: "#6b7280", letterSpacing: 1 }}>
-              + {txs.length - 12} weitere Transaktionen
+        </>
+      )}
+    </div>
+  );
+}
+
+// Sub-Komponente: Eine Insider-Gruppe (zusammengefasst + ausklappbar)
+function InsiderGroup({ group, type, expanded, onToggle, formatValue, formatShares }) {
+  const color = type === "buy" ? "#10b981" : "#ef4444";
+  const isMultiTrade = group.trades.length > 1;
+  
+  return (
+    <div style={{ 
+      background: "#0a0e1a",
+      border: `1px solid ${color}22`,
+      borderRadius: 4,
+      overflow: "hidden",
+      transition: "border-color 0.2s"
+    }}>
+      {/* HEADER (klickbar) */}
+      <div onClick={onToggle}
+        style={{ 
+          padding: "10px 12px",
+          cursor: "pointer",
+          display: "grid",
+          gridTemplateColumns: "1fr auto auto",
+          gap: 12,
+          alignItems: "center"
+        }}
+        onMouseEnter={e => e.currentTarget.style.background = "#0f1623"}
+        onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+      >
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600 }}>
+            <User size={10} color="#f59e0b" style={{ flexShrink: 0 }} />
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{group.name}</span>
+            {isMultiTrade && (
+              <span style={{ background: `${color}22`, color: color, fontSize: 8, padding: "2px 5px", borderRadius: 2, fontWeight: 700, letterSpacing: 0.5, flexShrink: 0 }}>
+                {group.trades.length}x
+              </span>
+            )}
+            {group.hasRealBuy && (
+              <span style={{ background: "#10b98122", color: "#10b981", fontSize: 8, padding: "2px 5px", borderRadius: 2, fontWeight: 700, letterSpacing: 0.5, flexShrink: 0 }}>
+                ECHT
+              </span>
+            )}
+          </div>
+          {group.role && (
+            <div style={{ fontSize: 9, color: "#10b981", marginTop: 2, letterSpacing: 0.5, fontWeight: 600 }}>{group.role}</div>
+          )}
+          <div style={{ fontSize: 9, color: "#6b7280", marginTop: 2 }}>{group.date}</div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color }}>{formatValue(group.totalValue)}</div>
+          <div style={{ fontSize: 9, color: "#6b7280" }}>{formatShares(group.totalShares)} @ ${formatPrice(group.avgPrice)}</div>
+        </div>
+        <div style={{ color: "#6b7280", fontSize: 14, paddingLeft: 4, transform: expanded ? "rotate(90deg)" : "rotate(0deg)", transition: "transform 0.2s" }}>
+          ›
+        </div>
+      </div>
+      
+      {/* EXPANDED DETAILS */}
+      {expanded && (
+        <div style={{ borderTop: `1px dashed ${color}22`, padding: "8px 12px", background: "#06080f" }}>
+          <div style={{ fontSize: 9, color: "#6b7280", letterSpacing: 1.5, marginBottom: 6 }}>EINZEL-TRADES</div>
+          {group.trades.map((t, i) => {
+            const codeLabel = { P: "ECHTER KAUF", S: "VERKAUF", A: "AWARD", M: "OPTIONS", G: "GESCHENK" }[t.code] || t.code;
+            return (
+              <div key={i} style={{ display: "grid", gridTemplateColumns: "auto 1fr auto", gap: 10, padding: "6px 0", fontSize: 10, borderBottom: i < group.trades.length - 1 ? "1px dotted #1f2937" : "none", alignItems: "center" }}>
+                <div style={{ background: `${color}15`, color, padding: "2px 6px", borderRadius: 2, fontSize: 9, fontWeight: 700, letterSpacing: 0.5 }}>
+                  {codeLabel}
+                </div>
+                <div style={{ color: "#9ca3af" }}>
+                  {formatShares(t.shares)} @ ${formatPrice(t.price)}
+                </div>
+                <div style={{ fontWeight: 700, color, fontSize: 11 }}>{formatValue(t.value)}</div>
+              </div>
+            );
+          })}
+          {group.trades[0]?.filingDate && (
+            <div style={{ fontSize: 9, color: "#6b7280", marginTop: 6, fontStyle: "italic" }}>
+              SEC-Filing: {group.trades[0].filingDate}
             </div>
           )}
-        </>
+        </div>
       )}
     </div>
   );
