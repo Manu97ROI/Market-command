@@ -147,6 +147,96 @@ export const getMultipleCandles = async (symbols, days = 5) => {
     .map(r => r.value);
 };
 
+// ============================================
+// FUNDAMENTALDATEN
+// /stock/metric liefert P/E, ROE, EPS Growth, Debt/Equity etc.
+// Wird selten aktualisiert (Quartal) -> langer Cache (24h)
+// ============================================
+const fundamentalsCache = new Map();
+const FUNDAMENTALS_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 Stunden
+
+const cachedFetchFundamentals = async (symbol) => {
+  const cacheKey = `metric:${symbol}`;
+  const cached = fundamentalsCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < FUNDAMENTALS_CACHE_TTL) {
+    return cached.data;
+  }
+  
+  const queryParams = new URLSearchParams({ 
+    endpoint: "stock/metric", 
+    symbol, 
+    metric: "all" 
+  }).toString();
+  const response = await fetch(`/api/finnhub?${queryParams}`);
+  
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({ error: "Unbekannter Fehler" }));
+    throw new Error(errData.error || `HTTP ${response.status}`);
+  }
+  
+  const data = await response.json();
+  fundamentalsCache.set(cacheKey, { data, timestamp: Date.now() });
+  return data;
+};
+
+export const getFundamentals = async (symbol) => {
+  try {
+    const data = await cachedFetchFundamentals(symbol);
+    if (!data || !data.metric) return null;
+    
+    const m = data.metric;
+    return {
+      // Profitabilitaet
+      roe: m.roeRfy || m.roeTTM || null,
+      roa: m.roaRfy || m.roaTTM || null,
+      grossMargin: m.grossMarginTTM || null,
+      netMargin: m.netMarginAnnual || m.netProfitMarginTTM || null,
+      
+      // Wachstum (5-Jahres Annualized falls verfuegbar)
+      epsGrowth5Y: m.epsGrowth5Y || null,
+      revenueGrowth5Y: m.revenueGrowth5Y || null,
+      epsGrowthTTMYoy: m.epsGrowthTTMYoy || null,
+      revenueGrowthTTMYoy: m.revenueGrowthTTMYoy || null,
+      
+      // Bewertung
+      pe: m.peNormalizedAnnual || m.peTTM || null,
+      pb: m.pbAnnual || m.pbQuarterly || null,
+      ps: m.psTTM || null,
+      peg: m.pegRatio || null,
+      
+      // Health
+      debtToEquity: m.totalDebt_totalEquityAnnual || m["totalDebt/totalEquityQuarterly"] || null,
+      currentRatio: m.currentRatioAnnual || m.currentRatioQuarterly || null,
+      
+      // Cashflow
+      fcfMargin: m.netCashFlowFromOperationsTTM || null,
+      
+      // Allgemein
+      marketCap: m.marketCapitalization || null,
+      week52High: m["52WeekHigh"] || null,
+      week52Low: m["52WeekLow"] || null,
+      beta: m.beta || null,
+      dividendYield: m.dividendYieldIndicatedAnnual || null
+    };
+  } catch (err) {
+    console.error("Fundamentals fetch failed:", symbol, err.message);
+    return null;
+  }
+};
+
+export const getMultipleFundamentals = async (symbols) => {
+  const results = await Promise.allSettled(
+    symbols.map(async (symbol) => {
+      const fundamentals = await getFundamentals(symbol);
+      return { symbol, fundamentals };
+    })
+  );
+  
+  return results
+    .filter(r => r.status === "fulfilled" && r.value.fundamentals)
+    .map(r => r.value);
+};
+
 // Symbol-Suche: nutze die US-Symbol-Liste von Finnhub
 let symbolCache = null;
 export const searchSymbols = async (query) => {
