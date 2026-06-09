@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown, Lock, LogOut } from "lucide-react";
-import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles, getFundamentals, getMultipleFundamentals } from "./finnhubClient.js";
+import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles, getFundamentals, getMultipleFundamentals, getInsiderTransactions, calcInsiderSentiment } from "./finnhubClient.js";
 import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
 import { TOP_50_US, isInUniverse, getSector } from "./universe.js";
 import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } from "./watchlistStorage.js";
@@ -279,6 +279,8 @@ function TradingApp({ onLogout }) {
   const [quoteDetails, setQuoteDetails] = useState({}); // { TICKER: { high, low, open, prevClose } }
   const [candleData, setCandleData] = useState({}); // { TICKER: [candles] }
   const [fundamentalsData, setFundamentalsData] = useState({}); // { TICKER: { roe, pe, peg, ... } }
+  const [insiderData, setInsiderData] = useState({}); // { TICKER: [transactions] }
+  const [insiderLoading, setInsiderLoading] = useState({}); // { TICKER: bool }
   const [liveStocks, setLiveStocks] = useState({});
   const [liveSearchResults, setLiveSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
@@ -646,12 +648,45 @@ function TradingApp({ onLogout }) {
   };
 
   // Wenn neue Aktie/Coin ausgewaehlt -> Detail oeffnen + ggf. hydraten
+  // Lade Insider Transactions fuer einen Ticker (lazy, nur wenn benoetigt)
+  const loadInsiderTransactions = async (ticker) => {
+    // Schon im Cache?
+    if (insiderData[ticker] !== undefined) return;
+    if (insiderLoading[ticker]) return;
+    
+    setInsiderLoading(prev => ({ ...prev, [ticker]: true }));
+    try {
+      const transactions = await getInsiderTransactions(ticker, 90);
+      setInsiderData(prev => ({ ...prev, [ticker]: transactions }));
+    } catch (err) {
+      console.error("Insider load failed:", err);
+      setInsiderData(prev => ({ ...prev, [ticker]: [] }));
+    } finally {
+      setInsiderLoading(prev => ({ ...prev, [ticker]: false }));
+    }
+  };
+  
+  // Lade Fundamentals fuer einen einzelnen Ticker on-demand
+  const loadSingleFundamentals = async (ticker) => {
+    if (fundamentalsData[ticker]) return;
+    try {
+      const f = await getFundamentals(ticker);
+      if (f) setFundamentalsData(prev => ({ ...prev, [ticker]: f }));
+    } catch (err) { console.error("Single fundamentals load failed:", err); }
+  };
+
   const selectStock = async (ticker, hint = {}) => {
     setSelectedStock(ticker);
     setQuery("");
     setLiveSearchResults([]);
     setTab("detail");
     await hydrateStock(ticker, hint);
+    
+    // Lade Insider + Fundamentals im Hintergrund (lazy, non-blocking)
+    if (hint.assetType !== "crypto" && !isCryptoTicker(ticker)) {
+      loadInsiderTransactions(ticker);
+      loadSingleFundamentals(ticker);
+    }
   };
 
   return (
@@ -748,7 +783,7 @@ function TradingApp({ onLogout }) {
         {tab === "daily" && <DailyTab stocks={dailyRanked} onSelect={selectStock} sortMode={dailySortMode} setSortMode={setDailySortMode} loadedCount={loadedUniverseQuotes} totalCount={50} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
         {tab === "watchlist" && <WatchlistTab stocks={watchlistStocks} onSelect={selectStock} onToggleWatchlist={toggleWatchlist} />}
         {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={selectStock} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
-        {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} fundamentals={fundamentalsData[selectedStock]} liveMetrics={(() => { const det = quoteDetails[selectedStock]; const cnd = candleData[selectedStock]; const stk = getEnrichedStockByTicker(selectedStock); if (!det || !stk) return null; return calcAllMetrics({ price: stk.price, high: det.high, low: det.low, open: det.open, prevClose: det.prevClose, change: stk.change }, cnd); })()} />}
+        {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} fundamentals={fundamentalsData[selectedStock]} liveMetrics={(() => { const det = quoteDetails[selectedStock]; const cnd = candleData[selectedStock]; const stk = getEnrichedStockByTicker(selectedStock); if (!det || !stk) return null; return calcAllMetrics({ price: stk.price, high: det.high, low: det.low, open: det.open, prevClose: det.prevClose, change: stk.change }, cnd); })()} insiderTransactions={insiderData[selectedStock]} insiderLoading={insiderLoading[selectedStock]} />}
         {tab === "lab" && selectedStock && getEnrichedStockByTicker(selectedStock) && <AnalysisLab stock={getEnrichedStockByTicker(selectedStock)} />}
 
         <div style={{ textAlign: "center", fontSize: 10, color: "#4b5563", letterSpacing: 2, padding: "32px 16px 16px" }}>
@@ -1043,7 +1078,7 @@ function LongTermTab({ stocks, onSelect, watchlist = [], onToggleWatchlist }) {
 // ============================================
 // DETAIL TAB - alles live
 // ============================================
-function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals, liveMetrics }) {
+function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals, liveMetrics, insiderTransactions, insiderLoading }) {
   // Long-Term Score live
   const longScore = calcLongTermScoreLive(fundamentals) ?? 50;
   // Daily Score: nutze Live wenn vorhanden, sonst fallback
@@ -1100,6 +1135,11 @@ function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals
             <BreakdownCard label="HEALTH" weight="15%" score={breakdown.health} />
           </div>
         </div>
+      )}
+
+      {/* INSIDER ACTIVITY PANEL */}
+      {!isCrypto && (
+        <InsiderPanel transactions={insiderTransactions} loading={insiderLoading} />
       )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
@@ -1163,6 +1203,146 @@ function BreakdownCard({ label, weight, score }) {
       <div style={{ height: 3, background: "#1f2937", borderRadius: 2, marginTop: 8, overflow: "hidden" }}>
         <div style={{ height: "100%", width: `${score}%`, background: getColor(score), transition: "width 0.4s" }} />
       </div>
+    </div>
+  );
+}
+
+// ============================================
+// INSIDER PANEL - Live SEC Form 4 Filings
+// ============================================
+function InsiderPanel({ transactions, loading }) {
+  const isLoaded = transactions !== undefined && !loading;
+  const txs = transactions || [];
+  
+  // Sentiment berechnen
+  const sentiment = useMemo(() => {
+    if (!txs || txs.length === 0) return null;
+    return calcInsiderSentiment(txs);
+  }, [txs]);
+
+  const formatValue = (v) => {
+    if (v >= 1000000) return `$${(v/1000000).toFixed(2)}M`;
+    if (v >= 1000) return `$${(v/1000).toFixed(0)}K`;
+    return `$${v.toFixed(0)}`;
+  };
+  
+  const formatShares = (s) => {
+    if (s >= 1000000) return `${(s/1000000).toFixed(2)}M`;
+    if (s >= 1000) return `${(s/1000).toFixed(0)}K`;
+    return s.toString();
+  };
+
+  const sentimentColor = sentiment 
+    ? (sentiment.score >= 70 ? "#10b981" : sentiment.score <= 30 ? "#ef4444" : "#9ca3af")
+    : "#9ca3af";
+  
+  const signalText = sentiment ? {
+    very_bullish: "STARK BULLISCH",
+    bullish: "BULLISCH",
+    neutral: "NEUTRAL",
+    bearish: "BAERISCH",
+    very_bearish: "STARK BAERISCH",
+    no_data: "KEINE DATEN"
+  }[sentiment.signal] : "—";
+
+  return (
+    <div style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 20, marginBottom: 20 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, paddingBottom: 10, borderBottom: "1px solid #1f2937" }}>
+        <User size={14} color="#f59e0b" />
+        <div style={{ fontSize: 11, letterSpacing: 2, fontWeight: 700 }}>INSIDER ACTIVITY (90 TAGE)</div>
+        <div style={{ marginLeft: "auto", fontSize: 11, color: "#6b7280" }}>SEC Form 4 Filings · Live</div>
+      </div>
+
+      {!isLoaded ? (
+        <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
+          <Loader2 size={16} style={{ margin: "0 auto 8px", animation: "spin 1s linear infinite" }} />
+          Lade Insider-Transaktionen...
+        </div>
+      ) : txs.length === 0 ? (
+        <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
+          Keine Insider-Aktivitaet in den letzten 90 Tagen.
+        </div>
+      ) : (
+        <>
+          {/* SENTIMENT SUMMARY */}
+          {sentiment && (
+            <div style={{ display: "grid", gridTemplateColumns: "auto 1fr 1fr 1fr", gap: 16, marginBottom: 18, padding: 14, background: "#0a0e1a", borderRadius: 4, border: "1px solid #1f2937", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>SIGNAL</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: sentimentColor }}>{signalText}</div>
+                <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>Score: {sentiment.score}/100</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>KAUF-VOLUMEN</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: "#10b981" }}>{formatValue(sentiment.totalBuy)}</div>
+                <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>{sentiment.buyCount} Trades</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>VERKAUF-VOLUMEN</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: "#ef4444" }}>{formatValue(sentiment.totalSell)}</div>
+                <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>{sentiment.sellCount} Trades</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 4 }}>UNIQUE KAEUFER</div>
+                <div style={{ fontSize: 16, fontWeight: 700, color: sentiment.uniqueBuyers >= 3 ? "#10b981" : "#9ca3af" }}>{sentiment.uniqueBuyers || 0}</div>
+                <div style={{ fontSize: 10, color: "#6b7280", marginTop: 2 }}>
+                  {sentiment.uniqueBuyers >= 3 ? "Cluster Buying!" : "—"}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TRANSACTION TABLE */}
+          <div>
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 100px 100px 110px 90px", gap: 10, padding: "8px 10px", fontSize: 9, letterSpacing: 1.5, color: "#6b7280", borderBottom: "1px solid #1f2937" }}>
+              <div>INSIDER</div>
+              <div>AKTION</div>
+              <div style={{ textAlign: "right" }}>SHARES @ PREIS</div>
+              <div style={{ textAlign: "right" }}>WERT</div>
+              <div style={{ textAlign: "right" }}>DATUM</div>
+            </div>
+            {txs.slice(0, 12).map((t, i) => {
+              const actionColor = t.action === "bought" ? "#10b981" : t.action === "sold" ? "#ef4444" : "#9ca3af";
+              const actionLabel = {
+                bought: "KAUF",
+                sold: "VERKAUF",
+                acquired: "OPTIONS",
+                other: "OTHER"
+              }[t.action] || t.action.toUpperCase();
+              return (
+                <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 100px 100px 110px 90px", gap: 10, padding: "10px 10px", fontSize: 11, borderBottom: "1px dashed #1f2937", alignItems: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <User size={11} color="#f59e0b" />
+                    <div>
+                      <div style={{ fontWeight: 600, fontSize: 11 }}>{t.name}</div>
+                      {t.role && <div style={{ fontSize: 9, color: "#6b7280", marginTop: 1 }}>{t.role}</div>}
+                    </div>
+                  </div>
+                  <div>
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 3, padding: "2px 7px", borderRadius: 3, fontSize: 9, fontWeight: 700, letterSpacing: 1, background: `${actionColor}15`, color: actionColor }}>
+                      {t.action === "bought" && <ArrowUpRight size={9} />}
+                      {t.action === "sold" && <ArrowDownRight size={9} />}
+                      {actionLabel}
+                    </span>
+                  </div>
+                  <div style={{ textAlign: "right", fontSize: 10 }}>
+                    <div>{formatShares(t.shares)}</div>
+                    <div style={{ fontSize: 9, color: "#6b7280" }}>@ ${formatPrice(t.price)}</div>
+                  </div>
+                  <div style={{ textAlign: "right", fontWeight: 700, color: actionColor, fontSize: 12 }}>{formatValue(t.value)}</div>
+                  <div style={{ textAlign: "right", fontSize: 9, color: "#9ca3af" }}>{t.date}</div>
+                </div>
+              );
+            })}
+          </div>
+          
+          {txs.length > 12 && (
+            <div style={{ textAlign: "center", padding: "10px 0", fontSize: 10, color: "#6b7280", letterSpacing: 1 }}>
+              + {txs.length - 12} weitere Transaktionen
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
