@@ -1,114 +1,20 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
 import { Search, Zap, Target, Fish, ArrowUpRight, ArrowDownRight, Building2, User, Flame, Anchor, Brain, Globe, Landmark, Gauge, Layers, Sparkles, Send, Loader2, TrendingUp, TrendingDown, AlertTriangle, CheckCircle2, History, Eye, AlertCircle, Calendar, Archive, Wifi, WifiOff, RefreshCw, Star, Plus, Activity, ArrowUpDown, Lock, LogOut } from "lucide-react";
-import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles } from "./finnhubClient.js";
+import { getQuote, getProfile, searchSymbols, formatMarketCap, getMultipleQuotes, getMultipleCandles, getFundamentals, getMultipleFundamentals } from "./finnhubClient.js";
 import { getCryptoQuote, getMultipleCryptoQuotes, searchCrypto, getCryptoProfile, formatCryptoMarketCap, isCryptoTicker, TICKER_TO_ID } from "./coingeckoClient.js";
 import { TOP_50_US, isInUniverse, getSector } from "./universe.js";
 import { loadWatchlist, saveWatchlist, addToWatchlist, removeFromWatchlist } from "./watchlistStorage.js";
 import { getAuthToken, login, clearAuthToken } from "./authStorage.js";
 import { calcAllMetrics, calcLiveDailyScore, formatRange, formatRangePosition, formatRangeMultiplier, formatMomentum } from "./dayTradingMetrics.js";
+import { calcLongTermScoreLive, getLongTermBreakdown, formatPct, formatRatio } from "./longTermScoring.js";
 
 // ============================================
-// STOCK DATABASE mit erweitertem Kontext fuer LLM
 // ============================================
-const STOCK_DB = {
-  NVDA: {
-    ticker: "NVDA", name: "NVIDIA Corp.", price: 184.32, change: 3.45, sector: "Technology", marketCap: "4.5T",
-    daily: { momentum: 88, gapPct: 2.1, preMarketVol: "high", intraDayRange: 4.2, volVsAvg: 1.85, catalyst: "AI Earnings Beat", catalystStrength: 90, breakoutProximity: 95, volatility: 82 },
-    longterm: { epsGrowth5Y: 68.5, revenueGrowth5Y: 52.3, moat: 95, debtToEquity: 0.15, roe: 115.4, fcfGrowth: 78.2, pe: 58.3, peg: 0.85, sectorTrend: 92 },
-    whales: [
-      { name: "Citadel Advisors", type: "hedge_fund", action: "bought", shares: 2400000, avgPrice: 178.50, value: "428M", date: "3d ago", confidence: "high" },
-      { name: "Berkshire Hathaway", type: "institution", action: "bought", shares: 850000, avgPrice: 175.20, value: "149M", date: "1w ago", confidence: "very_high" },
-      { name: "Jensen Huang (CEO)", type: "insider", action: "sold", shares: 120000, avgPrice: 182.10, value: "21.8M", date: "5d ago", confidence: "neutral" },
-      { name: "BlackRock", type: "institution", action: "bought", shares: 1800000, avgPrice: 176.80, value: "318M", date: "2w ago", confidence: "high" }
-    ],
-    context: "Marktfuehrer KI-Chips (~80% Data Center GPUs), abhaengig von TSMC Taiwan fuer Produktion. Hauptkunden: Microsoft, Google, Meta, Amazon. Export-Restriktionen China kritisch. CUDA-Software-Moat sehr stark."
-  },
-  AAPL: {
-    ticker: "AAPL", name: "Apple Inc.", price: 229.87, change: 1.23, sector: "Technology", marketCap: "3.4T",
-    daily: { momentum: 55, gapPct: 0.4, preMarketVol: "avg", intraDayRange: 1.8, volVsAvg: 0.95, catalyst: "None", catalystStrength: 30, breakoutProximity: 60, volatility: 45 },
-    longterm: { epsGrowth5Y: 15.2, revenueGrowth5Y: 8.5, moat: 92, debtToEquity: 1.45, roe: 148.2, fcfGrowth: 12.5, pe: 32.1, peg: 2.1, sectorTrend: 75 },
-    whales: [
-      { name: "Warren Buffett / BRK", type: "institution", action: "sold", shares: 100000000, avgPrice: 225.40, value: "22500M", date: "1m ago", confidence: "high" },
-      { name: "Vanguard Group", type: "institution", action: "bought", shares: 3200000, avgPrice: 228.10, value: "730M", date: "2w ago", confidence: "neutral" },
-      { name: "Tim Cook (CEO)", type: "insider", action: "sold", shares: 50000, avgPrice: 227.80, value: "11M", date: "1w ago", confidence: "neutral" }
-    ],
-    context: "iPhone ~50% Revenue. China 20% Revenue + Manufacturing Risk. Services wachsen stark. KI-Nachzuegler vs Google/Microsoft. Ecosystem Lock-in stark, aber Smartphone-Markt gesaettigt."
-  },
-  TSLA: {
-    ticker: "TSLA", name: "Tesla Inc.", price: 312.45, change: -2.15, sector: "Automotive", marketCap: "1.0T",
-    daily: { momentum: 28, gapPct: -1.8, preMarketVol: "high", intraDayRange: 5.2, volVsAvg: 1.45, catalyst: "Delivery Miss", catalystStrength: 75, breakoutProximity: 25, volatility: 88 },
-    longterm: { epsGrowth5Y: -8.5, revenueGrowth5Y: 22.4, moat: 62, debtToEquity: 0.18, roe: 18.5, fcfGrowth: -15.2, pe: 65.2, peg: 3.8, sectorTrend: 55 },
-    whales: [
-      { name: "Elon Musk", type: "insider", action: "bought", shares: 500000, avgPrice: 308.20, value: "154M", date: "4d ago", confidence: "very_high" },
-      { name: "ARK Invest", type: "hedge_fund", action: "bought", shares: 380000, avgPrice: 310.50, value: "118M", date: "1w ago", confidence: "high" },
-      { name: "Scion Asset Mgmt", type: "hedge_fund", action: "sold", shares: 250000, avgPrice: 315.20, value: "79M", date: "2w ago", confidence: "high" }
-    ],
-    context: "EV Leader aber BYD China holt auf. FSD/Robotaxi als Wachstums-Bet. Energy Storage Segment waechst. Musk-Risk (CEO-Distraction). China ~22% Revenue. Margen unter Druck durch Preiskriege."
-  },
-  MSFT: {
-    ticker: "MSFT", name: "Microsoft Corp.", price: 442.18, change: 0.87, sector: "Technology", marketCap: "3.3T",
-    daily: { momentum: 52, gapPct: 0.3, preMarketVol: "avg", intraDayRange: 1.2, volVsAvg: 0.88, catalyst: "None", catalystStrength: 25, breakoutProximity: 55, volatility: 38 },
-    longterm: { epsGrowth5Y: 18.5, revenueGrowth5Y: 15.8, moat: 94, debtToEquity: 0.35, roe: 38.5, fcfGrowth: 22.1, pe: 35.4, peg: 1.9, sectorTrend: 88 },
-    whales: [
-      { name: "Vanguard Group", type: "institution", action: "bought", shares: 1500000, avgPrice: 440.50, value: "660M", date: "1w ago", confidence: "neutral" },
-      { name: "Satya Nadella (CEO)", type: "insider", action: "bought", shares: 35000, avgPrice: 438.20, value: "15M", date: "2w ago", confidence: "very_high" },
-      { name: "State Street", type: "institution", action: "bought", shares: 920000, avgPrice: 441.10, value: "406M", date: "3w ago", confidence: "high" }
-    ],
-    context: "Cloud (Azure) + Enterprise + OpenAI Partner. Copilot KI-Monetization laeuft. Stabil diversifiziert. Azure waechst schneller als AWS. CapEx steigt stark fuer KI-Infrastruktur."
-  },
-  AMD: {
-    ticker: "AMD", name: "Advanced Micro Devices", price: 142.56, change: -1.42, sector: "Technology", marketCap: "230B",
-    daily: { momentum: 72, gapPct: -0.8, preMarketVol: "high", intraDayRange: 3.8, volVsAvg: 1.55, catalyst: "MI350 Launch", catalystStrength: 78, breakoutProximity: 85, volatility: 72 },
-    longterm: { epsGrowth5Y: 28.5, revenueGrowth5Y: 22.1, moat: 68, debtToEquity: 0.08, roe: 3.2, fcfGrowth: 18.5, pe: 185.3, peg: 1.2, sectorTrend: 85 },
-    whales: [
-      { name: "Citadel Advisors", type: "hedge_fund", action: "bought", shares: 1200000, avgPrice: 140.20, value: "168M", date: "2d ago", confidence: "high" },
-      { name: "Lisa Su (CEO)", type: "insider", action: "bought", shares: 25000, avgPrice: 139.80, value: "4M", date: "1w ago", confidence: "very_high" },
-      { name: "Fidelity", type: "institution", action: "bought", shares: 680000, avgPrice: 141.50, value: "96M", date: "2w ago", confidence: "high" }
-    ],
-    context: "NVIDIAs einziger echter GPU-Rivale. MI350/MI400 Chips direkt gegen NVDA H100/B200. CPU Marktanteil waechst vs Intel. Kleinere Skala = mehr Volatilitaet, aber mehr Upside."
-  },
-  BTC: {
-    ticker: "BTC", name: "Bitcoin", price: 96420.00, change: 2.85, sector: "Crypto", marketCap: "1.9T", assetType: "crypto",
-    daily: { momentum: 82, gapPct: 1.8, preMarketVol: "high", intraDayRange: 3.2, volVsAvg: 1.65, catalyst: "ETF Inflows", catalystStrength: 85, breakoutProximity: 92, volatility: 68 },
-    longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 85, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 78 },
-    whales: [
-      { name: "MicroStrategy", type: "institution", action: "bought", shares: 15400, avgPrice: 94500, value: "1450M", date: "3d ago", confidence: "very_high" },
-      { name: "BlackRock IBIT", type: "institution", action: "bought", shares: 8200, avgPrice: 95100, value: "780M", date: "1w ago", confidence: "high" },
-      { name: "Metaplanet", type: "institution", action: "bought", shares: 2100, avgPrice: 95800, value: "201M", date: "5d ago", confidence: "high" }
-    ],
-    context: "Digitales Gold Narrative. ETF-Inflows seit 2024 massiv. Halving-Cycle. Korrelation zu Tech-Aktien schwankt. Macro-Liquiditaet treibt den Kurs. Regulatorisches Risiko bleibt."
-  },
-  ETH: {
-    ticker: "ETH", name: "Ethereum", price: 3850.00, change: 1.45, sector: "Crypto", marketCap: "465B", assetType: "crypto",
-    daily: { momentum: 68, gapPct: 1.2, preMarketVol: "high", intraDayRange: 2.8, volVsAvg: 1.35, catalyst: "L2 Wachstum", catalystStrength: 65, breakoutProximity: 72, volatility: 62 },
-    longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 82, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 75 },
-    whales: [
-      { name: "BlackRock ETHA", type: "institution", action: "bought", shares: 125000, avgPrice: 3780, value: "473M", date: "5d ago", confidence: "high" },
-      { name: "Fidelity FETH", type: "institution", action: "bought", shares: 82000, avgPrice: 3820, value: "313M", date: "1w ago", confidence: "high" }
-    ],
-    context: "Programmable Money + DeFi + L2 Ecosystem (Arbitrum, Optimism, Base). Staking nach Merge. ETH-ETFs seit Mitte 2024. Konkurrenz von SOL und anderen Layer-1s. EIP-1559 macht ETH deflationaer bei hohem Use."
-  },
-  SOL: {
-    ticker: "SOL", name: "Solana", price: 215.00, change: 4.25, sector: "Crypto", marketCap: "100B", assetType: "crypto",
-    daily: { momentum: 85, gapPct: 3.8, preMarketVol: "high", intraDayRange: 5.5, volVsAvg: 1.85, catalyst: "DEX Volume Peak", catalystStrength: 78, breakoutProximity: 88, volatility: 78 },
-    longterm: { epsGrowth5Y: 0, revenueGrowth5Y: 0, moat: 68, debtToEquity: 0, roe: 0, fcfGrowth: 0, pe: 0, peg: 0, sectorTrend: 82 },
-    whales: [
-      { name: "Jump Crypto", type: "hedge_fund", action: "bought", shares: 280000, avgPrice: 210, value: "59M", date: "4d ago", confidence: "high" },
-      { name: "DeFi Capital", type: "hedge_fund", action: "bought", shares: 150000, avgPrice: 212, value: "32M", date: "1w ago", confidence: "neutral" }
-    ],
-    context: "Schnellste Layer-1, niedrige Fees, hohes Memecoin- und DEX-Volume. Network-Outages der Vergangenheit historisch ueberwunden. SOL-ETF moeglicher Katalysator 2025/2026. Direkter ETH-Konkurrent."
-  },
-  GOOGL: {
-    ticker: "GOOGL", name: "Alphabet Inc.", price: 198.45, change: 2.12, sector: "Technology", marketCap: "2.4T", assetType: "stock",
-    daily: { momentum: 68, gapPct: 1.2, preMarketVol: "above_avg", intraDayRange: 2.4, volVsAvg: 1.25, catalyst: "Gemini 3 Launch", catalystStrength: 70, breakoutProximity: 78, volatility: 52 },
-    longterm: { epsGrowth5Y: 22.4, revenueGrowth5Y: 18.2, moat: 90, debtToEquity: 0.12, roe: 32.5, fcfGrowth: 25.8, pe: 26.8, peg: 1.2, sectorTrend: 82 },
-    whales: [
-      { name: "Vanguard Group", type: "institution", action: "bought", shares: 2100000, avgPrice: 196.80, value: "413M", date: "1w ago", confidence: "neutral" },
-      { name: "Sundar Pichai (CEO)", type: "insider", action: "sold", shares: 22000, avgPrice: 197.50, value: "4M", date: "3w ago", confidence: "neutral" }
-    ],
-    context: "Suche-Monopol unter Druck (US Antitrust + KI-Konkurrenz). Gemini holt auf vs OpenAI. YouTube + Cloud stark. Waymo Robotaxi-Option. Regulatorisches Risiko hoch."
-  }
-};
+// LEGACY DEMO DATA REMOVED - alles laeuft jetzt live
+// STOCK_DB bleibt leer fuer Backwards-Compatibility, neue Architektur basiert
+// auf TOP_50_US universe + Live-Daten via Finnhub/CoinGecko
+// ============================================
+const STOCK_DB = {};
 
 // ============================================
 // SCORING FUNCTIONS
@@ -372,6 +278,7 @@ function TradingApp({ onLogout }) {
   const [liveQuotes, setLiveQuotes] = useState({}); // { TICKER: { price, change } }
   const [quoteDetails, setQuoteDetails] = useState({}); // { TICKER: { high, low, open, prevClose } }
   const [candleData, setCandleData] = useState({}); // { TICKER: [candles] }
+  const [fundamentalsData, setFundamentalsData] = useState({}); // { TICKER: { roe, pe, peg, ... } }
   const [liveStocks, setLiveStocks] = useState({});
   const [liveSearchResults, setLiveSearchResults] = useState([]);
   const [searching, setSearching] = useState(false);
@@ -474,9 +381,21 @@ function TradingApp({ onLogout }) {
   
   // Long-Term bleibt erstmal aus STOCK_DB (Demo-Daten mit Fundamentals)
   const longTermRanked = useMemo(() => {
-    const stocks = Object.values(STOCK_DB).map(s => getEnrichedStockByTicker(s.ticker)).filter(Boolean);
-    return stocks.map(s => ({ ...s, score: calcLongTermScore(s) })).sort((a, b) => b.score - a.score);
-  }, [liveQuotes, liveStocks]);
+    const universeTickers = TOP_50_US.map(s => s.ticker);
+    const stocks = universeTickers
+      .map(t => getEnrichedStockByTicker(t))
+      .filter(s => s && s.price > 0);
+    
+    const enriched = stocks.map(s => {
+      const fundamentals = fundamentalsData[s.ticker];
+      const liveScore = calcLongTermScoreLive(fundamentals);
+      const score = liveScore != null ? liveScore : 50; // Fallback wenn noch nicht geladen
+      const breakdown = getLongTermBreakdown(fundamentals);
+      return { ...s, score, fundamentals, breakdown };
+    });
+    
+    return enriched.sort((a, b) => b.score - a.score);
+  }, [liveQuotes, liveStocks, fundamentalsData]);
 
   // Watchlist Stocks (mit Live-Quotes wenn vorhanden)
   const watchlistStocks = useMemo(() => {
@@ -575,9 +494,36 @@ function TradingApp({ onLogout }) {
     }
   };
 
-  // Beim ersten Laden: Quotes refreshen + Auto-Refresh alle 60 Sekunden
+  // Hilfsfunktion: Fundamentaldaten fuer Top 50 in Batches laden
+  // Wird beim ersten Start aufgerufen, danach 24h gecacht
+  const loadFundamentals = async () => {
+    const universeTickers = TOP_50_US.map(s => s.ticker);
+    
+    // 2 Batches a 25 fuer API-Limit-Schonung
+    const batch1 = universeTickers.slice(0, 25);
+    const batch2 = universeTickers.slice(25);
+    
+    try {
+      const results1 = await getMultipleFundamentals(batch1);
+      const fundMap = {};
+      results1.forEach(r => { if (r.fundamentals) fundMap[r.symbol] = r.fundamentals; });
+      setFundamentalsData(prev => ({ ...prev, ...fundMap }));
+      
+      // Batch 2 nach kurzer Pause
+      await new Promise(r => setTimeout(r, 2000));
+      const results2 = await getMultipleFundamentals(batch2);
+      const fundMap2 = {};
+      results2.forEach(r => { if (r.fundamentals) fundMap2[r.symbol] = r.fundamentals; });
+      setFundamentalsData(prev => ({ ...prev, ...fundMap2 }));
+    } catch (err) {
+      console.error("Fundamentals load fehlgeschlagen:", err);
+    }
+  };
+
+  // Beim ersten Laden: Quotes refreshen + Auto-Refresh alle 60 Sekunden + Fundamentals einmal
   useEffect(() => {
     refreshQuotes();
+    loadFundamentals(); // einmal beim Start
     autoRefreshRef.current = setInterval(() => {
       refreshQuotes(false); // ohne Spinner, im Hintergrund
     }, 60 * 1000); // 60 Sekunden
@@ -802,11 +748,11 @@ function TradingApp({ onLogout }) {
         {tab === "daily" && <DailyTab stocks={dailyRanked} onSelect={selectStock} sortMode={dailySortMode} setSortMode={setDailySortMode} loadedCount={loadedUniverseQuotes} totalCount={50} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
         {tab === "watchlist" && <WatchlistTab stocks={watchlistStocks} onSelect={selectStock} onToggleWatchlist={toggleWatchlist} />}
         {tab === "longterm" && <LongTermTab stocks={longTermRanked} onSelect={selectStock} watchlist={watchlist} onToggleWatchlist={toggleWatchlist} />}
-        {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} />}
+        {tab === "detail" && selectedStock && getEnrichedStockByTicker(selectedStock) && <DetailTab stock={getEnrichedStockByTicker(selectedStock)} onLab={() => setTab("lab")} isWatched={isInWl(selectedStock)} onToggleWatchlist={() => toggleWatchlist(selectedStock)} fundamentals={fundamentalsData[selectedStock]} liveMetrics={(() => { const det = quoteDetails[selectedStock]; const cnd = candleData[selectedStock]; const stk = getEnrichedStockByTicker(selectedStock); if (!det || !stk) return null; return calcAllMetrics({ price: stk.price, high: det.high, low: det.low, open: det.open, prevClose: det.prevClose, change: stk.change }, cnd); })()} />}
         {tab === "lab" && selectedStock && getEnrichedStockByTicker(selectedStock) && <AnalysisLab stock={getEnrichedStockByTicker(selectedStock)} />}
 
         <div style={{ textAlign: "center", fontSize: 10, color: "#4b5563", letterSpacing: 2, padding: "32px 16px 16px" }}>
-          ◆ PHASE 2D · LIVE DAY-TRADING METRIKEN · WATCHLIST · ANALYSIS LAB ◆
+          ◆ PHASE 3 · ALL LIVE DATA · NO DEMO · WATCHLIST · ANALYSIS LAB ◆
         </div>
       </div>
     </div>
@@ -1001,74 +947,131 @@ function WatchlistTab({ stocks, onSelect, onToggleWatchlist }) {
 // ============================================
 // LONG-TERM TAB
 // ============================================
-function LongTermTab({ stocks, onSelect }) {
+function LongTermTab({ stocks, onSelect, watchlist = [], onToggleWatchlist }) {
+  const loadingCount = stocks.filter(s => !s.fundamentals).length;
+  
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
         <Anchor size={18} color="#10b981" />
         <div>
           <div style={{ fontSize: 16, fontWeight: 700 }}>Langfristige Kauf-Kandidaten</div>
-          <div style={{ fontSize: 11, color: "#6b7280" }}>Bewertet nach Growth, Moat, Financial Health, Sektor-Trend</div>
+          <div style={{ fontSize: 11, color: "#6b7280" }}>
+            {loadingCount > 0 ? `Lade Fundamentaldaten... (${stocks.length - loadingCount}/${stocks.length})` : "Bewertet nach Profitabilitaet, Wachstum, Bewertung, Financial Health"}
+          </div>
         </div>
       </div>
-      <div style={{ display: "grid", gap: 12 }}>
-        {stocks.map((s, i) => (
-          <div key={s.ticker} onClick={() => onSelect(s.ticker)}
-            style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 20, cursor: "pointer", display: "grid", gridTemplateColumns: "40px 140px 1fr 120px", gap: 20, alignItems: "center" }}
-            onMouseEnter={e => e.currentTarget.style.borderColor = "#10b981"} onMouseLeave={e => e.currentTarget.style.borderColor = "#1f2937"}>
-            <div style={{ fontSize: 24, fontWeight: 700, color: "#374151" }}>#{i+1}</div>
-            <div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: "#10b981" }}>{s.ticker}</div>
-              <div style={{ fontSize: 10, color: "#6b7280" }}>{s.sector} · {s.marketCap}</div>
-              <div style={{ fontSize: 13, marginTop: 4 }}>${formatPrice(s.price)}</div>
+      <div style={{ display: "grid", gap: 10 }}>
+        {stocks.map((s, i) => {
+          const inWL = watchlist.includes(s.ticker);
+          const hasFund = !!s.fundamentals;
+          const f = s.fundamentals || {};
+          const b = s.breakdown;
+          const epsGrowth = f.epsGrowth5Y != null ? f.epsGrowth5Y : f.epsGrowthTTMYoy;
+          const revGrowth = f.revenueGrowth5Y != null ? f.revenueGrowth5Y : f.revenueGrowthTTMYoy;
+          
+          return (
+            <div key={s.ticker}
+              style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 16, display: "grid", gridTemplateColumns: "32px 130px 1fr auto", gap: 16, alignItems: "center" }}
+              onMouseEnter={e => e.currentTarget.style.borderColor = "#10b981"}
+              onMouseLeave={e => e.currentTarget.style.borderColor = "#1f2937"}>
+              
+              <div style={{ fontSize: 18, fontWeight: 700, color: "#374151", textAlign: "center" }}>#{i+1}</div>
+              
+              <div onClick={() => onSelect(s.ticker)} style={{ cursor: "pointer" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 16, fontWeight: 700, color: "#10b981" }}>{s.ticker}</span>
+                  {s._live && <Wifi size={9} color="#10b981" />}
+                </div>
+                <div style={{ fontSize: 9, color: "#6b7280", marginTop: 2 }}>{s.sector}</div>
+                <div style={{ fontSize: 12, marginTop: 4, fontWeight: 600 }}>${formatPrice(s.price)}</div>
+              </div>
+
+              {/* 5 ECHTE FUNDAMENTAL-METRIKEN */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, fontSize: 11 }}>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>ROE</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: f.roe == null ? "#4b5563" : (f.roe >= 15 ? "#10b981" : f.roe >= 5 ? "#f59e0b" : "#ef4444") }}>
+                    {formatPct(f.roe)}
+                  </div>
+                </div>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>EPS GROWTH</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: epsGrowth == null ? "#4b5563" : (epsGrowth > 10 ? "#10b981" : epsGrowth > 0 ? "#f59e0b" : "#ef4444") }}>
+                    {formatPct(epsGrowth)}
+                  </div>
+                </div>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>P/E</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: f.pe == null ? "#4b5563" : (f.pe < 25 ? "#10b981" : f.pe < 40 ? "#f59e0b" : "#ef4444") }}>
+                    {formatRatio(f.pe)}
+                  </div>
+                </div>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>PEG</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: f.peg == null ? "#4b5563" : (f.peg > 0 && f.peg < 1 ? "#10b981" : f.peg < 2 ? "#f59e0b" : "#ef4444") }}>
+                    {formatRatio(f.peg)}
+                  </div>
+                </div>
+                <div style={{ padding: "6px 8px", background: "#0a0e1a", borderRadius: 4 }}>
+                  <div style={{ fontSize: 8, color: "#6b7280", letterSpacing: 1, marginBottom: 3 }}>D/E</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: f.debtToEquity == null ? "#4b5563" : (f.debtToEquity < 0.5 ? "#10b981" : f.debtToEquity < 1.5 ? "#f59e0b" : "#ef4444") }}>
+                    {formatRatio(f.debtToEquity)}
+                  </div>
+                </div>
+              </div>
+
+              {/* ACTIONS + SCORE */}
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <button onClick={(e) => { e.stopPropagation(); onToggleWatchlist && onToggleWatchlist(s.ticker); }}
+                  title={inWL ? "Aus Watchlist" : "Zur Watchlist"}
+                  style={{ background: "transparent", border: "1px solid " + (inWL ? "#f59e0b" : "#1f2937"), color: inWL ? "#f59e0b" : "#6b7280", padding: 6, borderRadius: 3, cursor: "pointer", display: "flex", alignItems: "center" }}>
+                  {inWL ? <Star size={12} fill="#f59e0b" /> : <Star size={12} />}
+                </button>
+                <div style={{ textAlign: "right", minWidth: 50 }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: getColor(s.score), lineHeight: 1 }}>{s.score}</div>
+                </div>
+              </div>
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, fontSize: 11 }}>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>EPS 5Y</div><div style={{ color: s.longterm.epsGrowth5Y > 0 ? "#10b981" : "#ef4444", fontWeight: 600 }}>{s.longterm.epsGrowth5Y}%</div></div>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>REV 5Y</div><div style={{ color: s.longterm.revenueGrowth5Y > 0 ? "#10b981" : "#ef4444", fontWeight: 600 }}>{s.longterm.revenueGrowth5Y}%</div></div>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>MOAT</div><div style={{ color: getColor(s.longterm.moat), fontWeight: 600 }}>{s.longterm.moat}</div></div>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>PEG</div><div style={{ color: s.longterm.peg > 0 && s.longterm.peg < 1 ? "#10b981" : s.longterm.peg < 2 ? "#f59e0b" : "#ef4444", fontWeight: 600 }}>{s.longterm.peg || "N/A"}</div></div>
-              <div><div style={{ color: "#6b7280", marginBottom: 2 }}>SEKTOR</div><div style={{ color: getColor(s.longterm.sectorTrend), fontWeight: 600 }}>{s.longterm.sectorTrend}</div></div>
-            </div>
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontSize: 32, fontWeight: 700, color: getColor(s.score), lineHeight: 1 }}>{s.score}</div>
-              <div style={{ fontSize: 9, letterSpacing: 2, color: getColor(s.score), fontWeight: 600, marginTop: 4 }}>{getSignal(s.score)}</div>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
 }
 
 // ============================================
-// DETAIL TAB
+// DETAIL TAB - alles live
 // ============================================
-function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist }) {
-  const dailyScore = calcDailyScore(s);
-  const longScore = calcLongTermScore(s);
-  const whaleScore = calcWhaleScore(s.whales);
-  const buying = s.whales.filter(w => w.action === "bought");
-  const selling = s.whales.filter(w => w.action === "sold");
-  const totalBuy = buying.reduce((sum, w) => sum + parseFloat(w.value.replace("M", "")), 0);
-  const totalSell = selling.reduce((sum, w) => sum + parseFloat(w.value.replace("M", "")), 0);
+function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist, fundamentals, liveMetrics }) {
+  // Long-Term Score live
+  const longScore = calcLongTermScoreLive(fundamentals) ?? 50;
+  // Daily Score: nutze Live wenn vorhanden, sonst fallback
+  const dailyScore = liveMetrics ? calcLiveDailyScore(liveMetrics, s) : 50;
+  
+  const breakdown = getLongTermBreakdown(fundamentals);
+  const f = fundamentals || {};
+  const m = liveMetrics || {};
+  const isCrypto = s.assetType === "crypto";
 
   return (
     <div>
       <div style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 24, marginBottom: 20 }}>
         <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 20 }}>
           <div>
-            <div style={{ fontSize: 10, letterSpacing: 2, color: "#6b7280" }}>{s.sector.toUpperCase()} · MCAP {s.marketCap}</div>
-            <div style={{ fontSize: 42, fontWeight: 700, color: "#10b981", lineHeight: 1.1, marginTop: 4 }}>{s.ticker}</div>
+            <div style={{ fontSize: 10, letterSpacing: 2, color: "#6b7280" }}>{(s.sector || "—").toUpperCase()}{s.marketCap ? ` · MCAP ${s.marketCap}` : ""}</div>
+            <div style={{ fontSize: 42, fontWeight: 700, color: isCrypto ? "#f59e0b" : "#10b981", lineHeight: 1.1, marginTop: 4 }}>{s.ticker}</div>
             <div style={{ fontSize: 13, color: "#9ca3af" }}>{s.name}</div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 12, marginTop: 12 }}>
               <div style={{ fontSize: 28, fontWeight: 600 }}>${formatPrice(s.price)}</div>
-              <div style={{ fontSize: 13, color: s.change >= 0 ? "#10b981" : "#ef4444" }}>{s.change >= 0 ? "+" : ""}{s.change}%</div>
+              <div style={{ fontSize: 13, color: s.change >= 0 ? "#10b981" : "#ef4444" }}>
+                {s.change >= 0 ? "+" : ""}{(s.change || 0).toFixed(2)}%
+              </div>
             </div>
           </div>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "flex-start" }}>
             <ScoreCard label="DAILY" icon={Zap} score={dailyScore} />
             <ScoreCard label="LONG-TERM" icon={Anchor} score={longScore} />
-            <ScoreCard label="WHALE SENTIMENT" icon={Fish} score={whaleScore} />
             <button onClick={onToggleWatchlist}
               title={isWatched ? "Aus Watchlist entfernen" : "Zur Watchlist hinzufuegen"}
               style={{ background: isWatched ? "rgba(245,158,11,0.15)" : "transparent", border: "1px solid " + (isWatched ? "rgba(245,158,11,0.5)" : "#1f2937"), borderRadius: 4, padding: "12px 14px", color: isWatched ? "#f59e0b" : "#9ca3af", fontFamily: "inherit", fontSize: 11, letterSpacing: 2, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, height: "fit-content" }}>
@@ -1082,76 +1085,83 @@ function DetailTab({ stock: s, onLab, isWatched, onToggleWatchlist }) {
         </div>
       </div>
 
-      <div style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 24, marginBottom: 20 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16, paddingBottom: 12, borderBottom: "1px solid #1f2937" }}>
-          <Fish size={16} color="#10b981" />
-          <div style={{ fontSize: 12, letterSpacing: 2, fontWeight: 700 }}>WHALE & INSIDER ACTIVITY</div>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
-          <div style={{ background: "rgba(16,185,129,0.05)", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 4, padding: 16 }}>
-            <div style={{ fontSize: 10, letterSpacing: 2, color: "#10b981", marginBottom: 6 }}>◆ BUYING PRESSURE</div>
-            <div style={{ fontSize: 24, fontWeight: 700 }}>${totalBuy.toFixed(0)}M</div>
-            <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>{buying.length} whale(s) accumulating</div>
+      {/* SCORE BREAKDOWN: Long-Term */}
+      {breakdown && (
+        <div style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 6, padding: 20, marginBottom: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, paddingBottom: 10, borderBottom: "1px solid #1f2937" }}>
+            <Anchor size={14} color="#10b981" />
+            <div style={{ fontSize: 11, letterSpacing: 2, fontWeight: 700 }}>LONG-TERM SCORE BREAKDOWN</div>
+            <div style={{ marginLeft: "auto", fontSize: 11, color: "#6b7280" }}>Live von Finnhub</div>
           </div>
-          <div style={{ background: "rgba(239,68,68,0.05)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 4, padding: 16 }}>
-            <div style={{ fontSize: 10, letterSpacing: 2, color: "#ef4444", marginBottom: 6 }}>◆ SELLING PRESSURE</div>
-            <div style={{ fontSize: 24, fontWeight: 700 }}>${totalSell.toFixed(0)}M</div>
-            <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 4 }}>{selling.length} whale(s) distributing</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+            <BreakdownCard label="PROFITABILITAET" weight="30%" score={breakdown.profitability} />
+            <BreakdownCard label="WACHSTUM" weight="30%" score={breakdown.growth} />
+            <BreakdownCard label="BEWERTUNG" weight="25%" score={breakdown.valuation} />
+            <BreakdownCard label="HEALTH" weight="15%" score={breakdown.health} />
           </div>
         </div>
-        <div>
-          <div style={{ display: "grid", gridTemplateColumns: "2fr 100px 100px 120px 90px 100px", gap: 12, padding: "10px 12px", fontSize: 10, letterSpacing: 2, color: "#6b7280", borderBottom: "1px solid #1f2937" }}>
-            <div>ENTITY</div><div>TYPE</div><div>ACTION</div><div style={{ textAlign: "right" }}>SHARES @ PRICE</div><div style={{ textAlign: "right" }}>VALUE</div><div style={{ textAlign: "right" }}>WHEN</div>
-          </div>
-          {s.whales.map((w, i) => (
-            <div key={i} style={{ display: "grid", gridTemplateColumns: "2fr 100px 100px 120px 90px 100px", gap: 12, padding: "14px 12px", fontSize: 12, borderBottom: "1px dashed #1f2937", alignItems: "center" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                {w.type === "insider" ? <User size={12} color="#f59e0b" /> : w.type === "hedge_fund" ? <Fish size={12} color="#8b5cf6" /> : <Building2 size={12} color="#60a5fa" />}
-                <div>
-                  <div style={{ fontWeight: 600 }}>{w.name}</div>
-                  {w.confidence === "very_high" && <div style={{ fontSize: 9, color: "#10b981", letterSpacing: 1, marginTop: 2 }}>◆ HIGH CONVICTION</div>}
-                </div>
-              </div>
-              <div style={{ fontSize: 10, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 1 }}>{w.type.replace("_", " ")}</div>
-              <div>
-                <span style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "3px 8px", borderRadius: 3, fontSize: 10, fontWeight: 700, letterSpacing: 1, background: w.action === "bought" ? "rgba(16,185,129,0.1)" : "rgba(239,68,68,0.1)", color: w.action === "bought" ? "#10b981" : "#ef4444" }}>
-                  {w.action === "bought" ? <ArrowUpRight size={10} /> : <ArrowDownRight size={10} />}{w.action.toUpperCase()}
-                </span>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div>{formatNum(w.shares)}</div>
-                <div style={{ fontSize: 10, color: "#6b7280" }}>@ ${formatPrice(w.avgPrice)}</div>
-              </div>
-              <div style={{ textAlign: "right", fontWeight: 700, color: w.action === "bought" ? "#10b981" : "#ef4444" }}>${w.value}</div>
-              <div style={{ textAlign: "right", fontSize: 10, color: "#9ca3af" }}>{w.date}</div>
-            </div>
-          ))}
-        </div>
-      </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
-        <DetailPanel title="DAILY SETUP" icon={Zap} color="#f59e0b">
-          <DetailRow label="Momentum" value={s.daily.momentum} score={s.daily.momentum} />
-          <DetailRow label="Catalyst" value={s.daily.catalyst} textValue />
-          <DetailRow label="Catalyst Strength" value={s.daily.catalystStrength} score={s.daily.catalystStrength} />
-          <DetailRow label="Gap %" value={`${s.daily.gapPct}%`} textValue />
-          <DetailRow label="Pre-Market Volume" value={s.daily.preMarketVol} textValue />
-          <DetailRow label="Intraday Range" value={`${s.daily.intraDayRange}%`} textValue />
-          <DetailRow label="Volume vs Avg" value={`${s.daily.volVsAvg}x`} textValue />
-          <DetailRow label="Breakout Proximity" value={s.daily.breakoutProximity} score={s.daily.breakoutProximity} />
-          <DetailRow label="Volatility" value={s.daily.volatility} score={s.daily.volatility} />
+        {/* DAILY LIVE METRIKEN */}
+        <DetailPanel title="DAILY LIVE METRIKEN" icon={Zap} color="#f59e0b">
+          {liveMetrics ? (
+            <>
+              <DetailRow label="Intraday Range" value={formatRange(m.intradayRange)} textValue />
+              <DetailRow label="Position im Tagesbereich" value={formatRangePosition(m.dayRangePosition)} textValue />
+              <DetailRow label="Distance vom Open" value={formatRange(m.distanceFromOpen)} textValue />
+              <DetailRow label="Range vs Average" value={formatRangeMultiplier(m.rangeVsAverage)} textValue />
+              <DetailRow label="Momentum" value={formatMomentum(m.momentum)} textValue />
+            </>
+          ) : (
+            <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
+              <Loader2 size={16} style={{ margin: "0 auto 8px", animation: "spin 1s linear infinite" }} />
+              Lade Live-Metriken...
+            </div>
+          )}
         </DetailPanel>
-        <DetailPanel title="LONG-TERM PROFILE" icon={Anchor} color="#10b981">
-          <DetailRow label="EPS Growth 5Y" value={`${s.longterm.epsGrowth5Y}%`} textValue />
-          <DetailRow label="Revenue Growth 5Y" value={`${s.longterm.revenueGrowth5Y}%`} textValue />
-          <DetailRow label="Moat Score" value={s.longterm.moat} score={s.longterm.moat} />
-          <DetailRow label="Debt/Equity" value={s.longterm.debtToEquity} textValue />
-          <DetailRow label="ROE" value={`${s.longterm.roe}%`} textValue />
-          <DetailRow label="FCF Growth" value={`${s.longterm.fcfGrowth}%`} textValue />
-          <DetailRow label="P/E Ratio" value={s.longterm.pe || "N/A"} textValue />
-          <DetailRow label="PEG Ratio" value={s.longterm.peg || "N/A"} textValue />
-          <DetailRow label="Sector Trend" value={s.longterm.sectorTrend} score={s.longterm.sectorTrend} />
+
+        {/* LONG-TERM FUNDAMENTALS */}
+        <DetailPanel title="FUNDAMENTALDATEN" icon={Anchor} color="#10b981">
+          {fundamentals ? (
+            <>
+              <DetailRow label="ROE" value={formatPct(f.roe)} textValue />
+              <DetailRow label="Net Margin" value={formatPct(f.netMargin)} textValue />
+              <DetailRow label="EPS Growth 5Y" value={formatPct(f.epsGrowth5Y ?? f.epsGrowthTTMYoy)} textValue />
+              <DetailRow label="Revenue Growth 5Y" value={formatPct(f.revenueGrowth5Y ?? f.revenueGrowthTTMYoy)} textValue />
+              <DetailRow label="P/E Ratio" value={formatRatio(f.pe)} textValue />
+              <DetailRow label="PEG Ratio" value={formatRatio(f.peg)} textValue />
+              <DetailRow label="P/B Ratio" value={formatRatio(f.pb)} textValue />
+              <DetailRow label="Debt/Equity" value={formatRatio(f.debtToEquity)} textValue />
+              <DetailRow label="Beta" value={formatRatio(f.beta)} textValue />
+              <DetailRow label="52W High" value={f.week52High ? `$${formatPrice(f.week52High)}` : "—"} textValue />
+              <DetailRow label="52W Low" value={f.week52Low ? `$${formatPrice(f.week52Low)}` : "—"} textValue />
+            </>
+          ) : (
+            <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
+              {isCrypto ? "Fundamentaldaten nicht verfuegbar fuer Crypto" : (
+                <>
+                  <Loader2 size={16} style={{ margin: "0 auto 8px", animation: "spin 1s linear infinite" }} />
+                  Lade Fundamentaldaten...
+                </>
+              )}
+            </div>
+          )}
         </DetailPanel>
+      </div>
+    </div>
+  );
+}
+
+function BreakdownCard({ label, weight, score }) {
+  return (
+    <div style={{ padding: 14, background: "#0a0e1a", borderRadius: 4, border: "1px solid #1f2937" }}>
+      <div style={{ fontSize: 9, letterSpacing: 1.5, color: "#6b7280", marginBottom: 6, display: "flex", justifyContent: "space-between" }}>
+        <span>{label}</span><span>{weight}</span>
+      </div>
+      <div style={{ fontSize: 22, fontWeight: 700, color: getColor(score), lineHeight: 1 }}>{score}</div>
+      <div style={{ height: 3, background: "#1f2937", borderRadius: 2, marginTop: 8, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${score}%`, background: getColor(score), transition: "width 0.4s" }} />
       </div>
     </div>
   );
@@ -1566,15 +1576,10 @@ function AnalysisLab({ stock }) {
 // ============================================
 async function generateAnalysis(stock, levelId, eventInput = "", priorAnalyses = null) {
   const stockCtx = `
-Aktie: ${stock.ticker} (${stock.name})
-Preis: $${stock.price} (${stock.change >= 0 ? "+" : ""}${stock.change}%)
-Sektor: ${stock.sector}, Market Cap: ${stock.marketCap}
-Kontext: ${stock.context}
-Daily-Score: ${calcDailyScore(stock)}, Long-Term-Score: ${calcLongTermScore(stock)}
-Catalyst heute: ${stock.daily.catalyst}
-5Y EPS Growth: ${stock.longterm.epsGrowth5Y}%, Revenue Growth: ${stock.longterm.revenueGrowth5Y}%
-P/E: ${stock.longterm.pe}, PEG: ${stock.longterm.peg}, Moat: ${stock.longterm.moat}/100
-Whales: ${stock.whales.map(w => `${w.name} ${w.action} $${w.value}`).join("; ")}
+Aktie: ${stock.ticker} (${stock.name || stock.ticker})
+Preis: $${stock.price} (${stock.change >= 0 ? "+" : ""}${(stock.change || 0).toFixed(2)}%)
+Sektor: ${stock.sector || "Unknown"}${stock.marketCap ? `, Market Cap: ${stock.marketCap}` : ""}
+Asset-Typ: ${stock.assetType || "stock"}
 `.trim();
 
   // Build prior analyses summary for historical validation
