@@ -237,6 +237,127 @@ export const getMultipleFundamentals = async (symbols) => {
     .map(r => r.value);
 };
 
+// ============================================
+// INSIDER TRANSACTIONS
+// /stock/insider-transactions liefert SEC Form 4 Filings
+// CEO/CFO/Director Kaeufe und Verkaeufe
+// Wird selten aktualisiert (max 1x/Tag) -> 6h Cache
+// ============================================
+const insiderCache = new Map();
+const INSIDER_CACHE_TTL = 6 * 60 * 60 * 1000; // 6 Stunden
+
+const cachedFetchInsider = async (symbol, fromDate) => {
+  const cacheKey = `insider:${symbol}:${fromDate}`;
+  const cached = insiderCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < INSIDER_CACHE_TTL) {
+    return cached.data;
+  }
+  
+  const queryParams = new URLSearchParams({ 
+    endpoint: "stock/insider-transactions", 
+    symbol,
+    from: fromDate
+  }).toString();
+  const response = await fetch(`/api/finnhub?${queryParams}`);
+  
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({ error: "Unbekannter Fehler" }));
+    throw new Error(errData.error || `HTTP ${response.status}`);
+  }
+  
+  const data = await response.json();
+  insiderCache.set(cacheKey, { data, timestamp: Date.now() });
+  return data;
+};
+
+// Hole Insider Transactions fuer eine Aktie der letzten N Tage
+export const getInsiderTransactions = async (symbol, days = 90) => {
+  try {
+    const fromDate = new Date();
+    fromDate.setDate(fromDate.getDate() - days);
+    const fromStr = fromDate.toISOString().split("T")[0]; // YYYY-MM-DD
+    
+    const data = await cachedFetchInsider(symbol, fromStr);
+    
+    if (!data || !data.data || !Array.isArray(data.data)) return [];
+    
+    // Verarbeite und normalisiere
+    return data.data
+      .filter(t => t.transactionDate && t.share && t.transactionPrice)
+      .map(t => {
+        const shares = Math.abs(parseInt(t.change || t.share) || 0);
+        const price = parseFloat(t.transactionPrice) || 0;
+        const value = shares * price;
+        // Finnhub liefert transactionCode: P=Purchase, S=Sale, A=Award, F=Tax, M=Option exercise, G=Gift
+        const code = t.transactionCode || "";
+        let action = "other";
+        if (code === "P") action = "bought";
+        else if (code === "S") action = "sold";
+        else if (code === "A" || code === "M") action = "acquired"; // Aktienprogramm/Optionen
+        else if (code === "F") action = "tax"; // Tax withholding
+        
+        return {
+          name: t.name || "Unknown Insider",
+          shares,
+          price,
+          value,
+          action,
+          code,
+          date: t.transactionDate,
+          filingDate: t.filingDate,
+          // Position koennte im "name" Feld stehen oder als role/title
+          role: t.role || t.position || null
+        };
+      })
+      .filter(t => t.action !== "tax") // Tax-Filings rausfiltern, das ist nur Zahlungsverkehr
+      .sort((a, b) => new Date(b.date) - new Date(a.date)); // neueste zuerst
+  } catch (err) {
+    console.error("Insider transactions fetch failed:", symbol, err.message);
+    return [];
+  }
+};
+
+// Aggregiertes Insider-Sentiment: Kauf vs Verkauf
+export const calcInsiderSentiment = (transactions) => {
+  if (!transactions || transactions.length === 0) {
+    return { score: 50, totalBuy: 0, totalSell: 0, buyCount: 0, sellCount: 0, signal: "no_data" };
+  }
+  
+  const buys = transactions.filter(t => t.action === "bought");
+  const sells = transactions.filter(t => t.action === "sold");
+  
+  const totalBuy = buys.reduce((sum, t) => sum + t.value, 0);
+  const totalSell = sells.reduce((sum, t) => sum + t.value, 0);
+  
+  // Score: 0-100, 50 = neutral, >70 = bullish (mehr Kaeufe), <30 = bearish (mehr Verkaeufe)
+  let score = 50;
+  const total = totalBuy + totalSell;
+  if (total > 0) {
+    score = Math.round((totalBuy / total) * 100);
+  }
+  
+  // Insider-Kaeufe sind sehr selten und sehr bullish
+  // Cluster-Buying: mehrere verschiedene Insider kaufen
+  const uniqueBuyers = new Set(buys.map(t => t.name)).size;
+  if (uniqueBuyers >= 3) score = Math.min(100, score + 15); // Cluster Buying Bonus
+  
+  let signal = "neutral";
+  if (score >= 70 && totalBuy > 100000) signal = "bullish"; // muss substantiell sein
+  else if (score >= 85) signal = "very_bullish";
+  else if (score <= 30 && totalSell > 1000000) signal = "bearish";
+  else if (score <= 15) signal = "very_bearish";
+  
+  return {
+    score,
+    totalBuy,
+    totalSell,
+    buyCount: buys.length,
+    sellCount: sells.length,
+    uniqueBuyers,
+    signal
+  };
+};
+
 // Symbol-Suche: nutze die US-Symbol-Liste von Finnhub
 let symbolCache = null;
 export const searchSymbols = async (query) => {
