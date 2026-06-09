@@ -329,20 +329,17 @@ export const calcInsiderSentiment = (transactions) => {
   const totalBuy = buys.reduce((sum, t) => sum + t.value, 0);
   const totalSell = sells.reduce((sum, t) => sum + t.value, 0);
   
-  // Score: 0-100, 50 = neutral, >70 = bullish (mehr Kaeufe), <30 = bearish (mehr Verkaeufe)
   let score = 50;
   const total = totalBuy + totalSell;
   if (total > 0) {
     score = Math.round((totalBuy / total) * 100);
   }
   
-  // Insider-Kaeufe sind sehr selten und sehr bullish
-  // Cluster-Buying: mehrere verschiedene Insider kaufen
   const uniqueBuyers = new Set(buys.map(t => t.name)).size;
-  if (uniqueBuyers >= 3) score = Math.min(100, score + 15); // Cluster Buying Bonus
+  if (uniqueBuyers >= 3) score = Math.min(100, score + 15);
   
   let signal = "neutral";
-  if (score >= 70 && totalBuy > 100000) signal = "bullish"; // muss substantiell sein
+  if (score >= 70 && totalBuy > 100000) signal = "bullish";
   else if (score >= 85) signal = "very_bullish";
   else if (score <= 30 && totalSell > 1000000) signal = "bearish";
   else if (score <= 15) signal = "very_bearish";
@@ -356,6 +353,86 @@ export const calcInsiderSentiment = (transactions) => {
     uniqueBuyers,
     signal
   };
+};
+
+// ============================================
+// COMPANY EXECUTIVES
+// /stock/executive liefert Top-Management mit Position/Title
+// Wird selten geaendert -> 7 Tage Cache
+// ============================================
+const executiveCache = new Map();
+const EXECUTIVE_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 Tage
+
+export const getExecutives = async (symbol) => {
+  const cacheKey = `executive:${symbol}`;
+  const cached = executiveCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < EXECUTIVE_CACHE_TTL) {
+    return cached.data;
+  }
+  
+  try {
+    const queryParams = new URLSearchParams({ endpoint: "stock/executive", symbol }).toString();
+    const response = await fetch(`/api/finnhub?${queryParams}`);
+    
+    if (!response.ok) return [];
+    
+    const data = await response.json();
+    const execs = (data.executive || []).map(e => ({
+      name: e.name || "",
+      position: e.position || e.title || "",
+      since: e.since || null,
+      age: e.age || null,
+      compensation: e.compensation || null
+    }));
+    
+    executiveCache.set(cacheKey, { data: execs, timestamp: Date.now() });
+    return execs;
+  } catch (err) {
+    console.error("Executives fetch failed:", symbol, err.message);
+    return [];
+  }
+};
+
+// Smart-Match: ordne einem Insider-Namen die Position zu falls Executive bekannt
+// Insider-Namen sind oft "STEVENS MARK A" oder "Kress Colette" oder "Neal Stephen C"
+// Executive-Namen sind oft "Mark A. Stevens" oder "Colette M. Kress"
+// Wir normalisieren beide und suchen Last-Name + First-Name Match
+const normalizeName = (name) => {
+  if (!name) return "";
+  return name
+    .toLowerCase()
+    .replace(/[\.,]/g, "")  // Punkte und Kommas raus
+    .replace(/\s+/g, " ")    // mehrfach-Spaces zu single
+    .trim()
+    .split(" ")
+    .filter(w => w.length > 1)  // Mittelinitialen rausfiltern
+    .sort()                      // Reihenfolge egal
+    .join(" ");
+};
+
+export const matchInsiderRole = (insiderName, executives) => {
+  if (!executives || executives.length === 0) return null;
+  
+  const insiderNorm = normalizeName(insiderName);
+  if (!insiderNorm) return null;
+  
+  // Exakter Match (normalisiert)
+  for (const exec of executives) {
+    if (normalizeName(exec.name) === insiderNorm) {
+      return exec.position;
+    }
+  }
+  
+  // Last-Name + First-Name Substring Match
+  const insiderParts = insiderNorm.split(" ");
+  for (const exec of executives) {
+    const execParts = normalizeName(exec.name).split(" ");
+    const overlap = insiderParts.filter(p => execParts.includes(p));
+    // Mindestens 2 Namens-Teile muessen uebereinstimmen
+    if (overlap.length >= 2) return exec.position;
+  }
+  
+  return null;
 };
 
 // Symbol-Suche: nutze die US-Symbol-Liste von Finnhub
